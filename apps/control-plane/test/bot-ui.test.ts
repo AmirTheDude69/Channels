@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { activeRunKeyboard, formatThreadHistory, formatThreadList, rootKeyboard, threadKeyboard } from '../src/telegram-ui.js';
+import { activeRunKeyboard, formatThreadHistory, formatThreadList, rootKeyboard, settingsKeyboard, threadKeyboard } from '../src/telegram-ui.js';
 import { applyThreadSelection, canRunTurn } from '../src/bot.js';
 
 describe('telegram ui', () => {
@@ -24,7 +24,7 @@ describe('telegram ui', () => {
         ],
         'thr_1',
       ),
-    ).toContain('◀ Alpha');
+    ).toContain('• <b>Alpha</b>');
   });
 
   it('creates thread action keyboard', () => {
@@ -57,6 +57,17 @@ describe('telegram ui', () => {
   it('keeps stop callback payloads within Telegram limits', () => {
     const callbackData = activeRunKeyboard('run_1234567890').inline_keyboard[0][0].callback_data;
     expect(callbackData?.length ?? 0).toBeLessThanOrEqual(64);
+  });
+
+  it('renders settings keyboard controls', () => {
+    expect(
+      settingsKeyboard({
+        planMode: false,
+        model: 'gpt-5.4',
+        reasoningEffort: 'medium',
+        speed: 'normal',
+      }).inline_keyboard.flat().map((item) => item.text),
+    ).toContain('Choose Model');
   });
 
   it('lets legacy thread selections run without a project', () => {
@@ -114,6 +125,10 @@ describe('telegram ui', () => {
           ],
         },
       ]),
-    ).toContain('Codex:\nHi there');
+    ).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining('<b>Codex</b>'),
+      ]),
+    );
   });
 });

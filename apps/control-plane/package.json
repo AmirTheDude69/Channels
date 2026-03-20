@@ -16,6 +16,7 @@
     "@fastify/websocket": "^11.2.0",
     "dotenv": "^17.2.2",
     "fastify": "^5.6.0",
+    "openai": "^6.8.1",
     "pg": "^8.16.3",
     "telegraf": "^4.16.3",
     "ws": "^8.18.3",

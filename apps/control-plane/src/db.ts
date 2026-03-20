@@ -1,5 +1,5 @@
 import { Pool } from 'pg';
-import type { ProjectRecord, CachedThread } from '@channels/shared';
+import type { ProjectRecord, CachedThread, ThreadRuntimePreference } from '@channels/shared';
 import { hashToken } from '@channels/shared';
 import { env, features } from './config.js';
 
@@ -32,6 +32,15 @@ export type RunRecord = {
   turnId: string | null;
   telegramMessageId: number | null;
   status: string;
+};
+
+type ThreadPreferenceRow = {
+  thread_id: string;
+  plan_mode: boolean;
+  model: string | null;
+  reasoning_effort: ThreadRuntimePreference['reasoningEffort'];
+  speed: ThreadRuntimePreference['speed'];
+  updated_at: string;
 };
 
 type ProjectCacheRow = {
@@ -102,6 +111,14 @@ const createStatements = [
     preview text not null default '',
     primary key (agent_id, thread_id)
   )`,
+  `create table if not exists thread_preferences (
+    thread_id text primary key,
+    plan_mode boolean not null default false,
+    model text,
+    reasoning_effort text,
+    speed text not null default 'normal',
+    updated_at timestamptz not null default now()
+  )`,
   `create table if not exists runs (
     run_id text primary key,
     chat_id text not null,
@@ -129,6 +146,7 @@ export class Database {
   private readonly memorySessions = new Map<string, ChatSession>();
   private readonly memoryProjects = new Map<string, Array<Omit<ProjectRecord, 'absolutePath'>>>();
   private readonly memoryThreads = new Map<string, CachedThread[]>();
+  private readonly memoryThreadPreferences = new Map<string, ThreadRuntimePreference>();
   private readonly memoryRuns = new Map<string, RunRecord>();
   private readonly memoryAudit: Array<{ actor: string; action: string; metadata: Record<string, unknown> }> = [];
 
@@ -370,6 +388,60 @@ export class Database {
           preview: row.preview,
         }
       : null;
+  }
+
+  async getThreadPreference(threadId: string): Promise<ThreadRuntimePreference | null> {
+    if (!this.pool) {
+      return this.memoryThreadPreferences.get(threadId) ?? null;
+    }
+
+    const result = await this.pool.query<ThreadPreferenceRow>(`select * from thread_preferences where thread_id = $1`, [threadId]);
+    const row = result.rows[0];
+    return row
+      ? {
+          threadId: row.thread_id,
+          planMode: row.plan_mode,
+          model: row.model,
+          reasoningEffort: row.reasoning_effort,
+          speed: row.speed,
+          updatedAt: row.updated_at,
+        }
+      : null;
+  }
+
+  async upsertThreadPreference(preference: ThreadRuntimePreference): Promise<ThreadRuntimePreference> {
+    const saved: ThreadRuntimePreference = {
+      ...preference,
+      updatedAt: preference.updatedAt ?? new Date().toISOString(),
+    };
+
+    if (!this.pool) {
+      this.memoryThreadPreferences.set(preference.threadId, structuredClone(saved));
+      return saved;
+    }
+
+    const result = await this.pool.query<ThreadPreferenceRow>(
+      `insert into thread_preferences (thread_id, plan_mode, model, reasoning_effort, speed, updated_at)
+       values ($1, $2, $3, $4, $5, now())
+       on conflict (thread_id) do update
+       set plan_mode = excluded.plan_mode,
+           model = excluded.model,
+           reasoning_effort = excluded.reasoning_effort,
+           speed = excluded.speed,
+           updated_at = now()
+       returning *`,
+      [preference.threadId, preference.planMode, preference.model, preference.reasoningEffort, preference.speed],
+    );
+
+    const row = result.rows[0];
+    return {
+      threadId: row.thread_id,
+      planMode: row.plan_mode,
+      model: row.model,
+      reasoningEffort: row.reasoning_effort,
+      speed: row.speed,
+      updatedAt: row.updated_at,
+    };
   }
 
   async upsertRun(run: RunRecord): Promise<void> {

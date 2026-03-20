@@ -13,6 +13,10 @@ Telegram control plane for local Codex threads.
 - Private DM Telegram bot for project and thread control
 - Hybrid architecture: Railway hosts the control plane, your Mac runs Codex
 - Live turn streaming and real `Stop` interrupts through the Codex app-server
+- Richer Telegram formatting with cleaner Codex-style headings, lists, and action summaries
+- Per-thread Telegram runtime controls for plan mode, speed, model, and reasoning effort
+- Voice note transcription through OpenAI speech-to-text
+- Photo and file attachments routed into Codex turns
 - Mostly-automatic approvals with Telegram escalation for out-of-policy actions
 - Local project registry in `~/.channels/projects.json`
 - macOS LaunchAgent installer for the local companion
@@ -85,10 +89,17 @@ Control-plane variables:
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_OWNER_ID`
 - `TELEGRAM_WEBHOOK_SECRET`
+- `OPENAI_API_KEY`
 - `PAIR_CODE_TTL_SECONDS`
 - `AGENT_HEARTBEAT_STALE_SECONDS`
+- `TELEGRAM_MAX_ATTACHMENT_BYTES`
 
 The control plane can boot without Telegram or Postgres so the first deploy succeeds, but full bot pairing and persistence need those variables set.
+
+Notes:
+
+- `OPENAI_API_KEY` is required for Telegram voice-note transcription
+- `TELEGRAM_MAX_ATTACHMENT_BYTES` defaults to `15000000` bytes
 
 ## Verification
 

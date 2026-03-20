@@ -3,6 +3,8 @@ import path from 'node:path';
 import { z } from 'zod';
 
 export const sandboxProfileSchema = z.enum(['read-only', 'workspace-write', 'danger-full-access']);
+export const reasoningEffortSchema = z.enum(['low', 'medium', 'high', 'xhigh']);
+export const speedModeSchema = z.enum(['normal', '2x']);
 
 export const projectRecordSchema = z.object({
   projectId: z.string().min(1),
@@ -41,9 +43,68 @@ export const transcriptTurnSchema = z.object({
 
 export type TranscriptTurn = z.infer<typeof transcriptTurnSchema>;
 
+export const threadRuntimePreferenceSchema = z.object({
+  threadId: z.string().min(1),
+  planMode: z.boolean().default(false),
+  model: z.string().nullable().default(null),
+  reasoningEffort: reasoningEffortSchema.nullable().default(null),
+  speed: speedModeSchema.default('normal'),
+  updatedAt: z.string().optional(),
+});
+
+export type ThreadRuntimePreference = z.infer<typeof threadRuntimePreferenceSchema>;
+
+export const threadRuntimePreferenceInputSchema = threadRuntimePreferenceSchema.omit({
+  threadId: true,
+  updatedAt: true,
+});
+
+export type ThreadRuntimePreferenceInput = z.infer<typeof threadRuntimePreferenceInputSchema>;
+
+export const runtimeModelSchema = z.object({
+  id: z.string().min(1),
+  displayName: z.string().min(1),
+  supportedReasoningEfforts: z.array(reasoningEffortSchema).default([]),
+  defaultReasoningEffort: reasoningEffortSchema.nullable().default(null),
+  inputModalities: z.array(z.string()).default([]),
+});
+
+export type RuntimeModel = z.infer<typeof runtimeModelSchema>;
+
+export const runtimeCatalogSchema = z.object({
+  models: z.array(runtimeModelSchema),
+  collaborationModes: z.array(z.string()).default([]),
+  defaults: z.object({
+    model: z.string().nullable().default(null),
+    reasoningEffort: reasoningEffortSchema.nullable().default(null),
+    planModeReasoningEffort: reasoningEffortSchema.nullable().default(null),
+    speed: speedModeSchema.default('normal'),
+  }),
+});
+
+export type RuntimeCatalog = z.infer<typeof runtimeCatalogSchema>;
+
+export const turnAttachmentSchema = z.discriminatedUnion('kind', [
+  z.object({
+    kind: z.literal('image'),
+    filename: z.string().min(1),
+    mediaType: z.string().default('image/jpeg'),
+    dataBase64: z.string().min(1),
+  }),
+  z.object({
+    kind: z.literal('file'),
+    filename: z.string().min(1),
+    mediaType: z.string().default('application/octet-stream'),
+    dataBase64: z.string().min(1),
+  }),
+]);
+
+export type TurnAttachment = z.infer<typeof turnAttachmentSchema>;
+
 export const controlRequestNameSchema = z.enum([
   'control.listThreads',
   'control.readThread',
+  'control.getRuntimeCatalog',
   'control.startThread',
   'control.resumeThread',
   'control.forkThread',
@@ -56,6 +117,7 @@ export const controlRequestNameSchema = z.enum([
 export const controlRequestSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('control.listThreads'), requestId: z.string(), projectId: z.string().nullable().optional() }),
   z.object({ type: z.literal('control.readThread'), requestId: z.string(), threadId: z.string(), limitTurns: z.number().int().positive().max(20).optional() }),
+  z.object({ type: z.literal('control.getRuntimeCatalog'), requestId: z.string() }),
   z.object({ type: z.literal('control.startThread'), requestId: z.string(), projectId: z.string() }),
   z.object({ type: z.literal('control.resumeThread'), requestId: z.string(), threadId: z.string(), projectId: z.string().nullable().optional() }),
   z.object({ type: z.literal('control.forkThread'), requestId: z.string(), threadId: z.string() }),
@@ -68,6 +130,8 @@ export const controlRequestSchema = z.discriminatedUnion('type', [
     projectId: z.string().nullable().optional(),
     prompt: z.string().min(1),
     chatId: z.string().optional(),
+    attachments: z.array(turnAttachmentSchema).default([]),
+    runtime: threadRuntimePreferenceInputSchema.optional(),
   }),
   z.object({
     type: z.literal('control.interruptTurn'),
@@ -286,12 +350,20 @@ export function chunkTelegramMessage(text: string, limit = 3800): string[] {
 type LooseThreadItem = {
   type?: string | null;
   text?: string | null;
+  phase?: string | null;
   content?: Array<{ type?: string | null; text?: string | null } | null> | null;
 };
 
 type LooseThreadTurn = {
   id?: string | null;
   items?: Array<LooseThreadItem | null> | null;
+};
+
+type LooseCommandExecutionItem = {
+  type?: string | null;
+  command?: string | null;
+  exitCode?: number | null;
+  status?: string | null;
 };
 
 function normalizeTranscriptText(text: string): string {
@@ -323,6 +395,9 @@ export function transcriptEntriesFromItems(items: Array<LooseThreadItem | null> 
     }
 
     if (itemType === 'agentmessage' || itemType.startsWith('agent')) {
+      if ((item.phase ?? '').toLowerCase() === 'commentary') {
+        continue;
+      }
       entries.push({ role: 'assistant', text });
     }
   }
@@ -406,4 +481,54 @@ export function permissionsAreSafe(project: ProjectRecord | null, permissions: {
     if (!isPathInside(project.absolutePath, root)) return false;
   }
   return true;
+}
+
+export function effectiveThreadRuntime(runtime: RuntimeCatalog, preference?: Partial<ThreadRuntimePreferenceInput> | null): ThreadRuntimePreferenceInput {
+  const preferredModel = preference?.model ?? runtime.defaults.model ?? runtime.models[0]?.id ?? 'gpt-5.4';
+  const selectedModel =
+    runtime.models.find((entry) => entry.id === preferredModel) ??
+    runtime.models.find((entry) => entry.id === runtime.defaults.model) ??
+    runtime.models[0] ??
+    null;
+  const model = selectedModel?.id ?? preferredModel;
+  const fallbackReasoning = preference?.planMode
+    ? runtime.defaults.planModeReasoningEffort ?? selectedModel?.defaultReasoningEffort ?? runtime.defaults.reasoningEffort ?? 'medium'
+    : selectedModel?.defaultReasoningEffort ?? runtime.defaults.reasoningEffort ?? 'medium';
+  const reasoningEffort = selectedModel?.supportedReasoningEfforts.includes(preference?.reasoningEffort ?? 'medium')
+    ? (preference?.reasoningEffort ?? 'medium')
+    : fallbackReasoning;
+
+  return {
+    planMode: preference?.planMode ?? false,
+    model,
+    reasoningEffort,
+    speed: preference?.speed ?? runtime.defaults.speed,
+  };
+}
+
+function truncateForActivity(text: string, limit = 84): string {
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  return normalized.length > limit ? `${normalized.slice(0, limit - 1)}…` : normalized;
+}
+
+export function summarizeCodexItem(item: unknown): string | null {
+  if (!item || typeof item !== 'object') return null;
+  const typed = item as Record<string, unknown>;
+  const itemType = String(typed.type ?? '').toLowerCase();
+
+  if (itemType === 'commandexecution') {
+    const commandItem = item as LooseCommandExecutionItem;
+    const command = truncateForActivity(commandItem.command ?? 'command');
+    return `Ran ${command}`;
+  }
+
+  if (itemType === 'plan') {
+    return 'Updated the plan';
+  }
+
+  if (itemType === 'contextcompaction') {
+    return 'Compressed working context';
+  }
+
+  return null;
 }

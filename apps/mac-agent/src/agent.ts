@@ -1,8 +1,15 @@
 import { randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import {
   type CachedThread,
+  effectiveThreadRuntime,
+  type RuntimeCatalog,
+  type ThreadRuntimePreferenceInput,
+  type TurnAttachment,
   type TranscriptTurn,
   assistantTextFromTranscriptTurn,
   classifyThreadProject,
@@ -181,14 +188,20 @@ export class ChannelsAgent {
           this.controlPlane.sendResponse(request.requestId, true, history);
           break;
         }
+        case 'control.getRuntimeCatalog': {
+          const runtimeCatalog = await this.readRuntimeCatalog();
+          this.controlPlane.sendResponse(request.requestId, true, runtimeCatalog);
+          break;
+        }
         case 'control.startThread': {
           const project = this.requireProject(String(message.projectId));
+          const runtimeCatalog = await this.readRuntimeCatalog();
           const result = (await this.codex.request('thread/start', {
             cwd: project.absolutePath,
             approvalPolicy: 'on-request',
             sandbox: project.sandboxProfile,
             personality: 'friendly',
-            model: 'gpt-5.4',
+            model: runtimeCatalog.defaults.model ?? 'gpt-5.4',
             serviceName: 'channels-mac-agent',
             persistExtendedHistory: true,
           })) as { thread: { id: string; title?: string | null } };
@@ -234,16 +247,39 @@ export class ChannelsAgent {
         case 'control.runTurn': {
           const threadId = String(message.threadId);
           const project = message.projectId ? this.projects.find((item) => item.projectId === String(message.projectId)) ?? null : null;
+          const runtimeCatalog = await this.readRuntimeCatalog();
+          const runtime = effectiveThreadRuntime(runtimeCatalog, (message.runtime as Partial<ThreadRuntimePreferenceInput> | undefined) ?? null);
+          await this.applyFastMode(runtime.speed === '2x');
+          const input = await this.buildTurnInput(
+            threadId,
+            String(message.prompt),
+            Array.isArray(message.attachments) ? (message.attachments as TurnAttachment[]) : [],
+            project,
+          );
           await this.codex.request('thread/resume', { threadId, personality: 'friendly', persistExtendedHistory: true }).catch(() => undefined);
           this.activeTurns.set(threadId, { requestId: request.requestId, threadId, projectId: project?.projectId ?? null, turnId: null });
-          await this.codex.request('turn/start', {
+          const turnRequest: Record<string, unknown> = {
             threadId,
             cwd: project?.absolutePath ?? null,
             approvalsReviewer: 'user',
             approvalPolicy: 'on-request',
             personality: 'friendly',
-            input: [{ type: 'text', text: String(message.prompt) }],
-          });
+            input,
+          };
+          if (runtime.planMode) {
+            turnRequest.collaborationMode = {
+              mode: 'plan',
+              settings: {
+                model: runtime.model,
+                reasoning_effort: runtime.reasoningEffort ?? runtimeCatalog.defaults.planModeReasoningEffort ?? 'medium',
+                developer_instructions: null,
+              },
+            };
+          } else {
+            turnRequest.model = runtime.model;
+            turnRequest.reasoningEffort = runtime.reasoningEffort;
+          }
+          await this.codex.request('turn/start', turnRequest);
           this.controlPlane.sendResponse(request.requestId, true, { accepted: true });
           void this.maybeRefreshCodexDesktopThread(threadId, 'turn started');
           break;
@@ -416,6 +452,149 @@ export class ChannelsAgent {
     });
   }
 
+  private async readRuntimeCatalog(): Promise<RuntimeCatalog> {
+    const [modelResponse, collaborationModesResponse, configResponse, fastModeEnabled] = await Promise.all([
+      this.codex.request('model/list', {}) as Promise<{
+        data?: Array<{
+          id?: string;
+          model?: string;
+          displayName?: string | null;
+          hidden?: boolean;
+          supportedReasoningEfforts?: Array<{ reasoningEffort?: ThreadRuntimePreferenceInput['reasoningEffort'] | null }>;
+          defaultReasoningEffort?: ThreadRuntimePreferenceInput['reasoningEffort'] | null;
+          inputModalities?: string[];
+        }>;
+      }>,
+      this.codex.request('collaborationMode/list', {}) as Promise<{
+        data?: Array<{ mode?: string | null }>;
+      }>,
+      this.codex.request('config/read', {}) as Promise<{
+        config?: {
+          model?: string | null;
+          model_reasoning_effort?: ThreadRuntimePreferenceInput['reasoningEffort'] | null;
+          plan_mode_reasoning_effort?: ThreadRuntimePreferenceInput['reasoningEffort'] | null;
+        };
+      }>,
+      this.readFastModeFromConfig(),
+    ]);
+
+    return {
+      models: (modelResponse.data ?? [])
+        .filter((model) => !model.hidden)
+        .map((model) => ({
+          id: String(model.id ?? model.model ?? 'unknown-model'),
+          displayName: String(model.displayName ?? model.id ?? model.model ?? 'Unknown model'),
+          supportedReasoningEfforts: (model.supportedReasoningEfforts ?? [])
+            .map((entry) => entry.reasoningEffort)
+            .filter((entry): entry is NonNullable<typeof entry> => Boolean(entry)),
+          defaultReasoningEffort: model.defaultReasoningEffort ?? null,
+          inputModalities: model.inputModalities ?? [],
+        })),
+      collaborationModes: (collaborationModesResponse.data ?? [])
+        .map((entry) => entry.mode ?? null)
+        .filter((entry): entry is string => Boolean(entry)),
+      defaults: {
+        model: configResponse.config?.model ?? null,
+        reasoningEffort: configResponse.config?.model_reasoning_effort ?? null,
+        planModeReasoningEffort: configResponse.config?.plan_mode_reasoning_effort ?? null,
+        speed: fastModeEnabled ? '2x' : 'normal',
+      },
+    };
+  }
+
+  private async readFastModeFromConfig(): Promise<boolean> {
+    try {
+      const configPath = path.join(os.homedir(), '.codex', 'config.toml');
+      const text = await readFile(configPath, 'utf8');
+      const match = text.match(/^\s*fast_mode\s*=\s*(true|false)\s*$/m);
+      return match?.[1] === 'true';
+    } catch {
+      return false;
+    }
+  }
+
+  private async applyFastMode(enabled: boolean): Promise<void> {
+    await this.codex.request('config/value/write', {
+      keyPath: 'fast_mode',
+      value: enabled,
+      mergeStrategy: 'replace',
+    });
+  }
+
+  private async buildTurnInput(
+    threadId: string,
+    prompt: string,
+    attachments: TurnAttachment[],
+    project: ProjectRecord | null,
+  ): Promise<Array<Record<string, unknown>>> {
+    const materialized = await this.materializeAttachments(threadId, attachments, project);
+    const filePaths = materialized.filter((entry) => entry.kind === 'file').map((entry) => entry.savedPath);
+    const imagePaths = materialized.filter((entry) => entry.kind === 'image').map((entry) => entry.savedPath);
+
+    let combinedPrompt = prompt.trim();
+    if (filePaths.length > 0) {
+      combinedPrompt = `${combinedPrompt}\n\nAttached file${filePaths.length > 1 ? 's' : ''} saved on disk:\n${filePaths.map((filePath) => `- ${filePath}`).join('\n')}\nPlease inspect ${filePaths.length > 1 ? 'them' : 'it'} as part of this request.`.trim();
+    }
+    if (!combinedPrompt) {
+      combinedPrompt = imagePaths.length > 0 ? 'Please inspect the attached image and help with it.' : 'Please inspect the attached files and help with them.';
+    }
+
+    return [
+      { type: 'text', text: combinedPrompt },
+      ...imagePaths.map((imagePath) => ({ type: 'localImage', path: imagePath })),
+    ];
+  }
+
+  private async materializeAttachments(
+    threadId: string,
+    attachments: TurnAttachment[],
+    project: ProjectRecord | null,
+  ): Promise<Array<{ kind: TurnAttachment['kind']; filename: string; savedPath: string }>> {
+    if (attachments.length === 0) {
+      return [];
+    }
+
+    const uploadDir = await this.resolveUploadDirectory(threadId, project);
+    const saved: Array<{ kind: TurnAttachment['kind']; filename: string; savedPath: string }> = [];
+
+    for (const attachment of attachments) {
+      const filename = this.sanitizeFilename(attachment.filename);
+      const savedPath = path.join(uploadDir, filename);
+      await writeFile(savedPath, Buffer.from(attachment.dataBase64, 'base64'));
+      saved.push({ kind: attachment.kind, filename, savedPath });
+    }
+
+    return saved;
+  }
+
+  private async resolveUploadDirectory(threadId: string, project: ProjectRecord | null): Promise<string> {
+    const baseRoot = project?.absolutePath ?? await this.lookupThreadCwd(threadId) ?? os.homedir();
+    const gitDir = path.join(baseRoot, '.git');
+    const insideGitDir = await this.isDirectory(gitDir);
+    const uploadRoot = insideGitDir ? path.join(gitDir, 'channels-uploads') : path.join(baseRoot, '.channels', 'uploads');
+    const uploadDir = path.join(uploadRoot, this.sanitizeFilename(threadId));
+    await mkdir(uploadDir, { recursive: true });
+    return uploadDir;
+  }
+
+  private async lookupThreadCwd(threadId: string): Promise<string | null> {
+    const threads = await this.listThreads();
+    return threads.find((thread) => thread.threadId === threadId)?.cwd ?? null;
+  }
+
+  private sanitizeFilename(filename: string): string {
+    return path.basename(filename).replace(/[^a-zA-Z0-9._-]+/g, '-');
+  }
+
+  private async isDirectory(candidatePath: string): Promise<boolean> {
+    try {
+      await access(candidatePath);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   private requireProject(projectId: string): ProjectRecord {
     const project = this.projects.find((item) => item.projectId === projectId);
     if (!project) {
@@ -434,7 +613,7 @@ export class ChannelsAgent {
         name?: string | null;
         title?: string | null;
         preview?: string | null;
-        turns?: Array<{ id?: string | null; items?: Array<{ type?: string | null; text?: string | null; content?: Array<{ type?: string | null; text?: string | null } | null> | null } | null> | null } | null>;
+        turns?: Array<{ id?: string | null; items?: Array<{ type?: string | null; text?: string | null; phase?: string | null; content?: Array<{ type?: string | null; text?: string | null } | null> | null } | null> | null } | null>;
       };
     };
 
