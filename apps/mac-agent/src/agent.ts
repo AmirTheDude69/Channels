@@ -31,22 +31,27 @@ export class ChannelsAgent {
   private readonly activeTurns = new Map<string, ActiveTurn>();
   private readonly pendingApprovals = new Map<string, PendingApproval>();
   private projects: ProjectRecord[] = [];
+  private initialized = false;
+  private heartbeatTimer: NodeJS.Timeout | null = null;
 
   constructor(private readonly serverUrl: string) {
     this.codex = new CodexAppServerClient(env.CHANNELS_CODEX_APP_SERVER_URL, env.CHANNELS_CODEX_APP_SERVER_PORT);
     this.controlPlane = new ControlPlaneClient(serverUrl);
+    this.controlPlane.onMessage(async (message) => {
+      await this.handleControlMessage(message);
+    });
   }
 
   async connect(query: Record<string, string>): Promise<void> {
     this.projects = await loadProjects();
-    await this.codex.connect();
-    this.codex.onNotification(async (message) => {
-      await this.handleCodexNotification(message);
-    });
+    if (!this.initialized) {
+      await this.codex.connect();
+      this.codex.onNotification(async (message) => {
+        await this.handleCodexNotification(message);
+      });
+      this.initialized = true;
+    }
     await this.controlPlane.connect(query);
-    this.controlPlane.onMessage(async (message) => {
-      await this.handleControlMessage(message);
-    });
     this.controlPlane.send({
       type: 'agent.hello',
       agentVersion: '0.1.0',
@@ -55,15 +60,22 @@ export class ChannelsAgent {
       pairedAt: new Date().toISOString(),
     });
     await this.syncAll();
-    setInterval(() => {
-      this.controlPlane.send({
-        type: 'agent.heartbeat',
-        connectedAt: new Date().toISOString(),
-        threadCount: 0,
-        projectCount: this.projects.length,
-        activeTurnCount: this.activeTurns.size,
-      });
-    }, 30_000).unref();
+    if (!this.heartbeatTimer) {
+      this.heartbeatTimer = setInterval(() => {
+        this.controlPlane.send({
+          type: 'agent.heartbeat',
+          connectedAt: new Date().toISOString(),
+          threadCount: 0,
+          projectCount: this.projects.length,
+          activeTurnCount: this.activeTurns.size,
+        });
+      }, 30_000);
+      this.heartbeatTimer.unref();
+    }
+  }
+
+  async waitUntilDisconnected(): Promise<void> {
+    await this.controlPlane.waitUntilClosed();
   }
 
   private async syncAll(): Promise<void> {

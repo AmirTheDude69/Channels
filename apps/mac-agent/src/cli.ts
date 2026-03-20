@@ -76,9 +76,17 @@ program
       throw new Error('Missing agent token. Run channels-agent pair first.');
     }
     const agent = new ChannelsAgent(serverUrl);
-    await agent.connect({ token: config.token, agentId: config.agentId ?? '' });
-    console.log('Channels agent connected. Press Ctrl+C to stop.');
-    await new Promise(() => undefined);
+    while (true) {
+      try {
+        await agent.connect({ token: config.token, agentId: config.agentId ?? '' });
+        console.log('Channels agent connected. Press Ctrl+C to stop.');
+        await agent.waitUntilDisconnected();
+        console.error('Channels agent disconnected. Reconnecting in 3 seconds...');
+      } catch (error) {
+        console.error(`Channels agent connection failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 3_000));
+    }
   });
 
 program.parseAsync(process.argv).catch((error) => {
