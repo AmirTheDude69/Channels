@@ -7,6 +7,7 @@ const envSchema = z.object({
   CHANNELS_SERVER_URL: z.string().url().optional(),
   CHANNELS_CODEX_APP_SERVER_URL: z.string().default('ws://127.0.0.1:8765'),
   CHANNELS_CODEX_APP_SERVER_PORT: z.coerce.number().int().positive().default(8765),
+  CHANNELS_CODEX_BIN: z.string().optional(),
 });
 
 export const env = envSchema.parse(process.env);

@@ -25,25 +25,27 @@ Telegram control plane for local Codex threads.
 4. Start the control plane:
    `pnpm dev:control-plane`
 5. Import your projects on the Mac:
-   `pnpm --filter @channels/mac-agent exec channels-agent import-projects --root /Users/amir/Downloads/Whims`
+   `node apps/mac-agent/dist/cli.js import-projects --root /Users/amir/Downloads/Whims`
 6. In Telegram, use `/pair` to generate a code
 7. Pair the local agent:
-   `pnpm --filter @channels/mac-agent exec channels-agent pair --server-url <wss-url> --pair-code <code>`
+   `node apps/mac-agent/dist/cli.js pair --server-url <wss-url> --pair-code <code>`
 
 ## One-Command macOS Install
 
 After building, install the LaunchAgent so the local companion starts on login:
 
 ```bash
-pnpm --filter @channels/mac-agent exec channels-agent install --server-url <wss-url>
+node apps/mac-agent/dist/cli.js install --server-url <wss-url>
 ```
 
 Useful follow-up commands:
 
 ```bash
-pnpm --filter @channels/mac-agent exec channels-agent doctor
-pnpm --filter @channels/mac-agent exec channels-agent run --server-url <wss-url>
+node apps/mac-agent/dist/cli.js doctor
+node apps/mac-agent/dist/cli.js run --server-url <wss-url>
 ```
+
+If `launchd` cannot find the Codex binary on your machine, set `CHANNELS_CODEX_BIN` to the full path. The mac-agent also auto-detects common macOS Codex install locations, including `/Applications/Codex.app/Contents/Resources/codex`.
 
 ## Railway Variables
 

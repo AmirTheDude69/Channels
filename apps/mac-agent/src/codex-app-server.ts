@@ -1,8 +1,10 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { access } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { WebSocket, type RawData } from 'ws';
+import { env } from './config.js';
 
 export type JsonRpcMessage = {
   id?: string | number;
@@ -22,7 +24,8 @@ export class CodexAppServerClient {
 
   async ensureStarted(): Promise<void> {
     if (this.process && !this.process.killed) return;
-    this.process = spawn('codex', ['app-server', '--listen', `ws://127.0.0.1:${this.port}`], {
+    const codexBinary = await resolveCodexBinary();
+    this.process = spawn(codexBinary, ['app-server', '--listen', `ws://127.0.0.1:${this.port}`], {
       stdio: 'pipe',
       env: process.env,
     });
@@ -107,4 +110,28 @@ export function defaultHostname(): string {
 
 export function normalizeThreadCwd(thread: { cwd?: string | null }): string {
   return thread.cwd ? path.resolve(thread.cwd) : process.cwd();
+}
+
+async function resolveCodexBinary(): Promise<string> {
+  const candidates = [
+    env.CHANNELS_CODEX_BIN,
+    '/Applications/Codex.app/Contents/Resources/codex',
+    '/opt/homebrew/bin/codex',
+    '/usr/local/bin/codex',
+    'codex',
+  ].filter((value): value is string => Boolean(value));
+
+  for (const candidate of candidates) {
+    if (candidate === 'codex') {
+      return candidate;
+    }
+    try {
+      await access(candidate);
+      return candidate;
+    } catch {
+      // Try the next known install location.
+    }
+  }
+
+  throw new Error('Unable to locate the Codex binary. Set CHANNELS_CODEX_BIN to the full path to Codex.');
 }
