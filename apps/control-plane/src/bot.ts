@@ -4,7 +4,7 @@ import path from 'node:path';
 import OpenAI, { toFile } from 'openai';
 import { Telegraf } from 'telegraf';
 import type { Context, NarrowedContext, Types } from 'telegraf';
-import type { Database, ChatSession, RunRecord } from './db.js';
+import type { Database, ChatSession, RunRecord, ForumThreadTopic } from './db.js';
 import type { AgentHub } from './agent-hub.js';
 import { env, features } from './config.js';
 import {
@@ -12,6 +12,7 @@ import {
   type RuntimeCatalog,
   type ThreadRuntimePreference,
   type ThreadRuntimePreferenceInput,
+  type TranscriptTurn,
   type TurnAttachment,
   createPairCode,
   effectiveThreadRuntime,
@@ -39,6 +40,12 @@ import {
   threadsKeyboard,
 } from './telegram-ui.js';
 import { plainTextToTelegramHtml } from './telegram-format.js';
+import {
+  buildForumTopicTitle,
+  formatForumPromptMirror,
+  formatForumTopicIntro,
+  formatForumTranscriptEntry,
+} from './forum-mirror.js';
 
 type TelegramTextContext = NarrowedContext<Context, Types.MountMap['text']>;
 type TelegramVoiceContext = NarrowedContext<Context, Types.MountMap['voice']>;
@@ -48,9 +55,15 @@ type TelegramDocumentContext = NarrowedContext<Context, Types.MountMap['document
 
 type TelegramReply = (message: string, extra?: Record<string, unknown>) => Promise<unknown>;
 
+type ChatTarget = {
+  chatId: string;
+  messageThreadId: number | null;
+};
+
 type ActiveRunState = {
   runId: string;
   chatId: string;
+  messageThreadId: number | null;
   threadId: string;
   requestId: string;
   turnId: string | null;
@@ -61,6 +74,7 @@ type ActiveRunState = {
   threadTitle: string;
   transcribedText: string | null;
   attachmentNames: string[];
+  mirrorTarget: ChatTarget | null;
 };
 
 type DownloadedTelegramFile = {
@@ -128,8 +142,9 @@ export function canRunTurn(session: Pick<ChatSession, 'activeProjectId' | 'activ
 export class BotController {
   readonly bot: Telegraf<Context> | null;
   private readonly runs = new Map<string, ActiveRunState>();
-  private readonly approvalChatByRequest = new Map<string, string>();
+  private readonly approvalChatByRequest = new Map<string, ChatTarget>();
   private readonly openai = features.hasOpenAI ? new OpenAI({ apiKey: env.OPENAI_API_KEY! }) : null;
+  private readonly forumEnsureByThread = new Map<string, Promise<ForumThreadTopic | null>>();
 
   constructor(private readonly db: Database, private readonly hub: AgentHub) {
     this.bot = features.hasTelegram ? new Telegraf<Context>(env.TELEGRAM_BOT_TOKEN!) : null;
@@ -164,6 +179,11 @@ export class BotController {
     this.bot.command('help', async (ctx) => {
       if (!(await this.ensureOwner(ctx))) return;
       await this.replyHtml(this.replyFromContext(ctx), 'Use <code>/start</code> to open the Channels dashboard. Send a normal message, a voice note, a photo, or a file to continue the active Codex thread.');
+    });
+
+    this.bot.command('forum', async (ctx) => {
+      if (!(await this.ensureOwner(ctx))) return;
+      await this.handleForumCommand(ctx);
     });
 
     this.bot.on('callback_query', async (ctx) => {
@@ -233,6 +253,36 @@ export class BotController {
     await this.db.createPairCode({ code, chatId: String(chatId), ownerTelegramId: String(telegramUserId) }, env.PAIR_CODE_TTL_SECONDS);
     await this.db.log('telegram', 'pair_code_created', { chatId, code });
     await this.replyHtml(reply, `Pair code: <code>${code}</code>\n\nRun this on your Mac companion:\n<code>channels-agent pair --server-url &lt;wss-url&gt; --pair-code ${code}</code>`);
+  }
+
+  async handleForumCommand(ctx: TelegramTextContext): Promise<void> {
+    const reply = this.replyFromContext(ctx);
+    const forumChatId = await this.getForumMirrorChatId();
+
+    if (ctx.chat.type === 'private') {
+      if (forumChatId) {
+        await this.replyHtml(reply, `Forum mirror is linked to chat <code>${plainTextToTelegramHtml(forumChatId)}</code>.\n\nAdd the bot to a Telegram supergroup with Topics enabled and send <code>/forum</code> there any time you want to re-link or re-sync.\n\nFor quick freeform replies inside topics, disable the bot privacy setting in BotFather with <code>/setprivacy</code>.`);
+      } else {
+        await this.replyHtml(reply, 'Forum mirror is not linked yet.\n\nCreate a Telegram supergroup with Topics enabled, add this bot, and send <code>/forum</code> there to connect it.\n\nFor quick freeform replies inside topics, disable the bot privacy setting in BotFather with <code>/setprivacy</code>.');
+      }
+      return;
+    }
+
+    if (!this.isForumCompatibleChat(ctx.chat)) {
+      await this.replyHtml(reply, 'This only works in a Telegram supergroup with Topics enabled.');
+      return;
+    }
+
+    const linked = await this.db.setForumMirrorChat(String(ctx.chat.id), String(ctx.from!.id));
+    await this.db.log('telegram', 'forum_linked', {
+      chatId: linked.chatId,
+      linkedByTelegramId: linked.linkedByTelegramId,
+      title: 'title' in ctx.chat ? ctx.chat.title ?? null : null,
+    });
+    await this.replyHtml(reply, '<b>Forum mirror linked.</b>\n\nI’ll create one topic per Codex thread here and keep future turns synced.\n\nTo allow normal quick messages inside topics, disable the bot privacy setting in BotFather with <code>/setprivacy</code>.');
+    void this.syncForumMirror(String(ctx.chat.id)).catch((error) => {
+      console.error('[forum] initial sync failed', JSON.stringify({ chatId: String(ctx.chat.id), error: serializeError(error) }));
+    });
   }
 
   async renderHome(chatId: number | string, telegramUserId: number | string, reply: TelegramReply): Promise<void> {
@@ -370,6 +420,19 @@ export class BotController {
   async handleText(ctx: TelegramTextContext): Promise<void> {
     if (!ctx.from) return;
     const reply = this.replyFromContext(ctx);
+    const forumContext = await this.resolveForumThreadContext(String(ctx.chat.id), this.messageThreadIdFromMessage(ctx.message));
+    if (forumContext) {
+      await this.startTurnForResolvedThread({
+        reply,
+        target: this.targetFromMessage(ctx.chat.id, ctx.message),
+        thread: forumContext.thread,
+        prompt: ctx.message.text,
+        transcribedText: null,
+        attachments: [],
+        attachmentNames: [],
+      });
+      return;
+    }
     const session = await this.ensureSession(ctx.chat.id, ctx.from.id);
     if (session.pendingAction === 'rename_thread' && session.pendingPayload?.threadId) {
       await this.renameThread(ctx.chat.id, ctx.from.id, String(session.pendingPayload.threadId), ctx.message.text, reply);
@@ -413,6 +476,19 @@ export class BotController {
         messageId: ctx.message.message_id,
         transcriptLength: transcribedText.length,
       }));
+      const forumContext = await this.resolveForumThreadContext(String(ctx.chat.id), this.messageThreadIdFromMessage(ctx.message));
+      if (forumContext) {
+        await this.startTurnForResolvedThread({
+          reply,
+          target: this.targetFromMessage(ctx.chat.id, ctx.message),
+          thread: forumContext.thread,
+          prompt: transcribedText,
+          transcribedText,
+          attachments: [],
+          attachmentNames: [],
+        });
+        return;
+      }
       await this.startTurn(ctx.chat.id, ctx.from.id, reply, {
         prompt: transcribedText,
         transcribedText,
@@ -461,6 +537,19 @@ export class BotController {
         messageId: ctx.message.message_id,
         transcriptLength: transcribedText.length,
       }));
+      const forumContext = await this.resolveForumThreadContext(String(ctx.chat.id), this.messageThreadIdFromMessage(ctx.message));
+      if (forumContext) {
+        await this.startTurnForResolvedThread({
+          reply,
+          target: this.targetFromMessage(ctx.chat.id, ctx.message),
+          thread: forumContext.thread,
+          prompt: transcribedText,
+          transcribedText,
+          attachments: [],
+          attachmentNames: [],
+        });
+        return;
+      }
       await this.startTurn(ctx.chat.id, ctx.from.id, reply, {
         prompt: transcribedText,
         transcribedText,
@@ -491,19 +580,30 @@ export class BotController {
     try {
       const file = await this.downloadTelegramFile(photo.file_id, `photo-${photo.file_unique_id}.jpg`);
       const prompt = (ctx.message.caption ?? '').trim() || 'Please inspect the attached image and help with it.';
-      await this.startTurn(ctx.chat.id, ctx.from.id, reply, {
+      const turnArgs = {
         prompt,
         transcribedText: null,
         attachmentNames: [file.filename],
         attachments: [
           {
-            kind: 'image',
+            kind: 'image' as const,
             filename: file.filename,
             mediaType: file.mediaType,
             dataBase64: file.buffer.toString('base64'),
           },
         ],
-      });
+      };
+      const forumContext = await this.resolveForumThreadContext(String(ctx.chat.id), this.messageThreadIdFromMessage(ctx.message));
+      if (forumContext) {
+        await this.startTurnForResolvedThread({
+          reply,
+          target: this.targetFromMessage(ctx.chat.id, ctx.message),
+          thread: forumContext.thread,
+          ...turnArgs,
+        });
+        return;
+      }
+      await this.startTurn(ctx.chat.id, ctx.from.id, reply, turnArgs);
     } catch (error) {
       console.error('[photo] failed', JSON.stringify({
         chatId: ctx.chat.id,
@@ -523,19 +623,30 @@ export class BotController {
     try {
       const file = await this.downloadTelegramFile(ctx.message.document.file_id, ctx.message.document.file_name ?? `file-${ctx.message.document.file_unique_id}`);
       const prompt = (ctx.message.caption ?? '').trim() || `Please inspect the attached file ${file.filename} and help with it.`;
-      await this.startTurn(ctx.chat.id, ctx.from.id, reply, {
+      const turnArgs = {
         prompt,
         transcribedText: null,
         attachmentNames: [file.filename],
         attachments: [
           {
-            kind: 'file',
+            kind: 'file' as const,
             filename: file.filename,
             mediaType: file.mediaType,
             dataBase64: file.buffer.toString('base64'),
           },
         ],
-      });
+      };
+      const forumContext = await this.resolveForumThreadContext(String(ctx.chat.id), this.messageThreadIdFromMessage(ctx.message));
+      if (forumContext) {
+        await this.startTurnForResolvedThread({
+          reply,
+          target: this.targetFromMessage(ctx.chat.id, ctx.message),
+          thread: forumContext.thread,
+          ...turnArgs,
+        });
+        return;
+      }
+      await this.startTurn(ctx.chat.id, ctx.from.id, reply, turnArgs);
     } catch (error) {
       console.error('[document] failed', JSON.stringify({
         chatId: ctx.chat.id,
@@ -737,8 +848,15 @@ export class BotController {
         await this.editHtml(run.chatId, run.telegramMessageId, chunks[0]).catch(() => undefined);
       }
       for (const chunk of chunks.slice(run.telegramMessageId ? 1 : 0)) {
-        await this.sendHtml(run.chatId, chunk);
+        await this.sendHtmlToTarget({ chatId: run.chatId, messageThreadId: run.messageThreadId }, chunk);
       }
+      if (run.mirrorTarget) {
+        const mirrorChunks = formatForumTranscriptEntry({ role: 'assistant', text: finalText });
+        for (const chunk of mirrorChunks) {
+          await this.sendHtmlToTarget(run.mirrorTarget, chunk);
+        }
+      }
+      await this.markForumTurnMirrored(run.threadId, String(message.turnId));
       await this.db.upsertRun({
         runId: run.runId,
         chatId: run.chatId,
@@ -759,7 +877,7 @@ export class BotController {
       if (run.telegramMessageId) {
         await this.editHtml(run.chatId, run.telegramMessageId, text).catch(() => undefined);
       } else {
-        await this.sendHtml(run.chatId, text);
+        await this.sendHtmlToTarget({ chatId: run.chatId, messageThreadId: run.messageThreadId }, text);
       }
       await this.db.upsertRun({
         runId: run.runId,
@@ -775,10 +893,14 @@ export class BotController {
     }
 
     if (message.type === 'approval.requested') {
-      const chatId = this.approvalChatByRequest.get(String(message.requestId)) ?? Array.from(this.runs.values()).find((run) => run.requestId === message.requestId)?.chatId;
-      if (!chatId) return;
-      this.approvalChatByRequest.set(String(message.approvalRequestId), chatId);
-      await this.sendHtml(chatId, `<b>${summarizeApprovalKind(message.kind as never)}</b>\n\n${String(message.summary)}`, {
+      const target = this.approvalChatByRequest.get(String(message.requestId))
+        ?? (() => {
+          const run = Array.from(this.runs.values()).find((entry) => entry.requestId === message.requestId);
+          return run ? { chatId: run.chatId, messageThreadId: run.messageThreadId } : null;
+        })();
+      if (!target) return;
+      this.approvalChatByRequest.set(String(message.approvalRequestId), target);
+      await this.sendHtmlToTarget(target, `<b>${summarizeApprovalKind(message.kind as never)}</b>\n\n${String(message.summary)}`, {
         reply_markup: {
           inline_keyboard: [[
             { text: 'Approve', callback_data: `approval:${String(message.approvalRequestId)}:accept` },
@@ -786,6 +908,226 @@ export class BotController {
           ]],
         },
       });
+    }
+  }
+
+  private isForumCompatibleChat(chat: Context['chat'] | undefined | null): boolean {
+    if (!chat || chat.type !== 'supergroup') return false;
+    return Boolean((chat as Context['chat'] & { is_forum?: boolean }).is_forum);
+  }
+
+  private messageThreadIdFromMessage(message: { message_thread_id?: number } | undefined | null): number | null {
+    return typeof message?.message_thread_id === 'number' ? message.message_thread_id : null;
+  }
+
+  private targetFromMessage(chatId: number | string, message: { message_thread_id?: number } | undefined | null): ChatTarget {
+    return {
+      chatId: String(chatId),
+      messageThreadId: this.messageThreadIdFromMessage(message),
+    };
+  }
+
+  private sameTarget(a: ChatTarget | null | undefined, b: ChatTarget | null | undefined): boolean {
+    return Boolean(a && b && a.chatId === b.chatId && a.messageThreadId === b.messageThreadId);
+  }
+
+  private async getForumMirrorChatId(): Promise<string | null> {
+    if (env.TELEGRAM_FORUM_CHAT_ID) {
+      return env.TELEGRAM_FORUM_CHAT_ID;
+    }
+    const linked = await this.db.getForumMirrorChat();
+    return linked?.chatId ?? null;
+  }
+
+  private async syncForumMirror(chatId: string): Promise<void> {
+    const agentId = this.hub.getConnectedAgentId();
+    if (!agentId) return;
+    const threads = await this.hub.listAllThreads(agentId);
+    for (const thread of threads) {
+      try {
+        await this.ensureForumMirrorForThread(agentId, thread.threadId);
+      } catch (error) {
+        console.error('[forum] sync thread failed', JSON.stringify({
+          chatId,
+          threadId: thread.threadId,
+          error: serializeError(error),
+        }));
+      }
+    }
+  }
+
+  private async resolveForumThreadContext(
+    chatId: string,
+    messageThreadId: number | null,
+  ): Promise<{ agentId: string; thread: CachedThread; topic: ForumThreadTopic } | null> {
+    if (!messageThreadId) return null;
+    const forumChatId = await this.getForumMirrorChatId();
+    if (!forumChatId || forumChatId !== chatId) return null;
+
+    const topic = await this.db.findForumThreadTopic(chatId, messageThreadId);
+    if (!topic) return null;
+
+    const agentId = this.hub.getConnectedAgentId();
+    if (!agentId) return null;
+
+    const thread = await this.db.getThread(agentId, topic.threadId);
+    if (!thread) return null;
+
+    return { agentId, thread, topic };
+  }
+
+  private async ensureForumMirrorForThread(agentId: string, threadId: string): Promise<ForumThreadTopic | null> {
+    const inFlight = this.forumEnsureByThread.get(threadId);
+    if (inFlight) {
+      return await inFlight;
+    }
+
+    const promise = this.ensureForumMirrorForThreadInner(agentId, threadId)
+      .finally(() => {
+        this.forumEnsureByThread.delete(threadId);
+      });
+
+    this.forumEnsureByThread.set(threadId, promise);
+    return await promise;
+  }
+
+  private async ensureForumMirrorForThreadInner(agentId: string, threadId: string): Promise<ForumThreadTopic | null> {
+    if (!this.bot) return null;
+
+    const forumChatId = await this.getForumMirrorChatId();
+    if (!forumChatId) return null;
+
+    const thread = await this.db.getThread(agentId, threadId);
+    if (!thread) return null;
+
+    const projects = await this.hub.listProjects(agentId);
+    const project = thread.projectId ? projects.find((entry) => entry.projectId === thread.projectId) ?? null : null;
+    const topicName = buildForumTopicTitle(project?.name ?? null, thread.title);
+
+    let topic = await this.db.getForumThreadTopic(threadId);
+    let created = false;
+
+    if (!topic || topic.chatId !== forumChatId) {
+      const createdTopic = await this.bot.telegram.callApi('createForumTopic', {
+        chat_id: Number(forumChatId),
+        name: topicName,
+      }) as { message_thread_id: number };
+
+      topic = await this.db.upsertForumThreadTopic({
+        threadId,
+        chatId: forumChatId,
+        topicId: createdTopic.message_thread_id,
+        topicName,
+        lastMirroredTurnId: null,
+      });
+      created = true;
+    } else if (topic.topicName !== topicName) {
+      try {
+        await this.bot.telegram.callApi('editForumTopic', {
+          chat_id: Number(forumChatId),
+          message_thread_id: topic.topicId,
+          name: topicName,
+        });
+      } catch (error) {
+        console.error('[forum] rename topic failed', JSON.stringify({
+          chatId: forumChatId,
+          topicId: topic.topicId,
+          threadId,
+          error: serializeError(error),
+        }));
+      }
+
+      topic = await this.db.upsertForumThreadTopic({
+        ...topic,
+        topicName,
+      });
+    }
+
+    return await this.syncForumThreadHistory(agentId, thread, topic, { sendIntro: created || topic.lastMirroredTurnId === null });
+  }
+
+  private async syncForumThreadHistory(
+    agentId: string,
+    thread: CachedThread,
+    topic: ForumThreadTopic,
+    options: { sendIntro: boolean },
+  ): Promise<ForumThreadTopic> {
+    const target = { chatId: topic.chatId, messageThreadId: topic.topicId };
+    const projects = await this.hub.listProjects(agentId);
+    const project = thread.projectId ? projects.find((entry) => entry.projectId === thread.projectId) ?? null : null;
+
+    if (options.sendIntro) {
+      await this.sendHtmlToTarget(target, formatForumTopicIntro({
+        threadTitle: thread.title,
+        projectName: project?.name ?? null,
+        legacy: thread.legacy,
+      }));
+    }
+
+    const history = (await this.hub.sendRequest(agentId, {
+      type: 'control.readThread',
+      requestId: randomUUID(),
+      threadId: thread.threadId,
+      limitTurns: 0,
+    })) as { turns: TranscriptTurn[] };
+
+    let pendingTurns = history.turns;
+    if (topic.lastMirroredTurnId) {
+      const lastMirroredIndex = history.turns.findIndex((turn) => turn.turnId === topic.lastMirroredTurnId);
+      if (lastMirroredIndex >= 0) {
+        pendingTurns = history.turns.slice(lastMirroredIndex + 1);
+      }
+    }
+
+    let latestTopic = topic;
+    for (const turn of pendingTurns) {
+      await this.mirrorTranscriptTurn(target, turn);
+      latestTopic = await this.db.upsertForumThreadTopic({
+        ...latestTopic,
+        lastMirroredTurnId: turn.turnId,
+      });
+    }
+
+    return latestTopic;
+  }
+
+  private async mirrorTranscriptTurn(target: ChatTarget, turn: TranscriptTurn): Promise<void> {
+    for (const entry of turn.entries) {
+      const chunks = formatForumTranscriptEntry(entry);
+      for (const chunk of chunks) {
+        await this.sendHtmlToTarget(target, chunk);
+      }
+    }
+  }
+
+  private async markForumTurnMirrored(threadId: string, turnId: string): Promise<void> {
+    const topic = await this.db.getForumThreadTopic(threadId);
+    if (!topic) return;
+    await this.db.upsertForumThreadTopic({
+      ...topic,
+      lastMirroredTurnId: turnId,
+    });
+  }
+
+  private async mirrorPromptToForum(
+    target: ChatTarget,
+    args: {
+      prompt: string;
+      transcribedText: string | null;
+      attachments: TurnAttachment[];
+      attachmentNames: string[];
+      originLabel: string;
+    },
+  ): Promise<void> {
+    const chunks = formatForumPromptMirror({
+      prompt: args.prompt,
+      transcribedText: args.transcribedText,
+      attachmentNames: args.attachmentNames,
+      originLabel: args.originLabel,
+    });
+
+    for (const chunk of chunks) {
+      await this.sendHtmlToTarget(target, chunk);
     }
   }
 
@@ -804,6 +1146,12 @@ export class BotController {
   private async showActiveThread(chatId: number, telegramUserId: number, reply: TelegramReply): Promise<void> {
     const context = await this.loadActiveThreadContext(chatId, telegramUserId, reply);
     if (!context) return;
+    void this.ensureForumMirrorForThread(context.agentId, context.thread.threadId).catch((error) => {
+      console.error('[forum] ensure mirror failed', JSON.stringify({
+        threadId: context.thread.threadId,
+        error: serializeError(error),
+      }));
+    });
     await this.replyHtml(
       reply,
       formatThreadHeader(context.thread.title, context.runtimeCatalog, context.preference),
@@ -866,6 +1214,32 @@ export class BotController {
     );
   }
 
+  private async startTurnForResolvedThread(args: {
+    reply: TelegramReply;
+    target: ChatTarget;
+    thread: CachedThread;
+    prompt: string;
+    transcribedText: string | null;
+    attachments: TurnAttachment[];
+    attachmentNames: string[];
+  }): Promise<void> {
+    const agentId = this.hub.getConnectedAgentId();
+    if (!agentId) {
+      await this.replyHtml(args.reply, 'Mac companion is offline. Pair it first with <code>/pair</code>.');
+      return;
+    }
+
+    await this.dispatchTurn(agentId, args.reply, {
+      target: args.target,
+      thread: args.thread,
+      prompt: args.prompt,
+      transcribedText: args.transcribedText,
+      attachments: args.attachments,
+      attachmentNames: args.attachmentNames,
+      mirrorOriginLabel: null,
+    });
+  }
+
   private async startTurn(
     chatId: number,
     telegramUserId: number,
@@ -878,8 +1252,8 @@ export class BotController {
     },
   ): Promise<void> {
     const session = await this.ensureSession(chatId, telegramUserId);
-
-    if (!this.hub.getConnectedAgentId()) {
+    const agentId = this.hub.getConnectedAgentId();
+    if (!agentId) {
       await this.replyHtml(reply, 'Mac companion is offline. Pair it first with <code>/pair</code>.');
       return;
     }
@@ -894,13 +1268,53 @@ export class BotController {
       if (!threadId) return;
       session.activeThreadId = threadId;
     }
-
-    const agentId = this.hub.getConnectedAgentId()!;
-    const runtimeCatalog = await this.getRuntimeCatalog(agentId);
-    const preference = await this.db.getThreadPreference(threadId);
-    const runtime = effectiveThreadRuntime(runtimeCatalog, preference);
     const thread = await this.db.getThread(agentId, threadId);
-    const threadTitle = thread?.title ?? `Thread ${threadId.slice(0, 8)}`;
+    if (!thread) {
+      await this.replyHtml(reply, 'That thread is no longer in the synced cache. Refresh and try again.');
+      return;
+    }
+    await this.dispatchTurn(agentId, reply, {
+      target: { chatId: String(chatId), messageThreadId: null },
+      thread,
+      prompt: args.prompt,
+      transcribedText: args.transcribedText,
+      attachments: args.attachments,
+      attachmentNames: args.attachmentNames,
+      mirrorOriginLabel: 'from command center',
+    });
+  }
+
+  private async dispatchTurn(
+    agentId: string,
+    reply: TelegramReply,
+    args: {
+      target: ChatTarget;
+      thread: CachedThread;
+      prompt: string;
+      transcribedText: string | null;
+      attachments: TurnAttachment[];
+      attachmentNames: string[];
+      mirrorOriginLabel: string | null;
+    },
+  ): Promise<void> {
+    const runtimeCatalog = await this.getRuntimeCatalog(agentId);
+    const preference = await this.db.getThreadPreference(args.thread.threadId);
+    const runtime = effectiveThreadRuntime(runtimeCatalog, preference);
+    const threadTitle = args.thread.title ?? `Thread ${args.thread.threadId.slice(0, 8)}`;
+    const forumTopic = await this.ensureForumMirrorForThread(agentId, args.thread.threadId);
+    const mirrorTarget = forumTopic && !this.sameTarget(args.target, { chatId: forumTopic.chatId, messageThreadId: forumTopic.topicId })
+      ? { chatId: forumTopic.chatId, messageThreadId: forumTopic.topicId }
+      : null;
+
+    if (mirrorTarget && args.mirrorOriginLabel) {
+      await this.mirrorPromptToForum(mirrorTarget, {
+        prompt: args.prompt,
+        transcribedText: args.transcribedText,
+        attachments: args.attachments,
+        attachmentNames: args.attachmentNames,
+        originLabel: args.mirrorOriginLabel,
+      });
+    }
 
     const requestId = randomUUID();
     const runId = randomUUID();
@@ -915,8 +1329,9 @@ export class BotController {
       pendingMessageId = typeof pending?.message_id === 'number' ? pending.message_id : null;
     } catch (error) {
       console.error('[turn] failed to send working message', JSON.stringify({
-        chatId,
-        threadId,
+        chatId: args.target.chatId,
+        messageThreadId: args.target.messageThreadId,
+        threadId: args.thread.threadId,
         requestId,
         hasTranscription: Boolean(args.transcribedText),
         attachmentCount: args.attachmentNames.length,
@@ -925,10 +1340,13 @@ export class BotController {
       const fallbackText = args.transcribedText
         ? `Transcribed voice note:\n${args.transcribedText}\n\nWorking on it...`
         : 'Working on it...';
-      const pending = await this.sendPlain(String(chatId), fallbackText, { reply_markup: activeRunKeyboard(runId) }).catch((fallbackError) => {
+      const pending = await this.sendPlainToTarget(args.target, fallbackText, {
+        reply_markup: activeRunKeyboard(runId),
+      }).catch((fallbackError) => {
         console.error('[turn] failed to send fallback working message', JSON.stringify({
-          chatId,
-          threadId,
+          chatId: args.target.chatId,
+          messageThreadId: args.target.messageThreadId,
+          threadId: args.thread.threadId,
           requestId,
           error: serializeError(fallbackError),
         }));
@@ -937,11 +1355,12 @@ export class BotController {
       pendingMessageId = pending?.message_id ?? null;
     }
 
-    this.approvalChatByRequest.set(requestId, String(chatId));
+    this.approvalChatByRequest.set(requestId, args.target);
     this.runs.set(requestId, {
       runId,
-      chatId: String(chatId),
-      threadId,
+      chatId: args.target.chatId,
+      messageThreadId: args.target.messageThreadId,
+      threadId: args.thread.threadId,
       requestId,
       turnId: null,
       telegramMessageId: pendingMessageId,
@@ -951,12 +1370,13 @@ export class BotController {
       threadTitle,
       transcribedText: args.transcribedText,
       attachmentNames: args.attachmentNames,
+      mirrorTarget,
     });
 
     const runRecord: RunRecord = {
       runId,
-      chatId: String(chatId),
-      threadId,
+      chatId: args.target.chatId,
+      threadId: args.thread.threadId,
       requestId,
       turnId: null,
       telegramMessageId: pendingMessageId,
@@ -965,23 +1385,23 @@ export class BotController {
     await this.db.upsertRun(runRecord);
 
     try {
-      await this.hub.sendRequest(this.hub.getConnectedAgentId()!, {
+      await this.hub.sendRequest(agentId, {
         type: 'control.runTurn',
         requestId,
-        threadId,
-        projectId: session.activeProjectId ?? undefined,
+        threadId: args.thread.threadId,
+        projectId: args.thread.projectId ?? undefined,
         prompt: args.prompt,
         attachments: args.attachments,
         runtime,
-        chatId: String(chatId),
+        chatId: args.target.chatId,
       });
     } catch (error) {
       this.runs.delete(requestId);
       const message = `<b>Failed to start turn</b>\n\n${plainTextToTelegramHtml(summarizeContextError(error, 'Codex did not accept the turn.'))}`;
       if (pendingMessageId) {
-        await this.editHtml(String(chatId), pendingMessageId, message).catch(() => undefined);
+        await this.editHtml(args.target.chatId, pendingMessageId, message).catch(() => undefined);
       } else {
-        await this.sendHtml(String(chatId), message).catch(() => undefined);
+        await this.sendHtml(args.target.chatId, message, args.target.messageThreadId ? { message_thread_id: args.target.messageThreadId } : undefined).catch(() => undefined);
       }
     }
   }
@@ -1081,9 +1501,23 @@ export class BotController {
     return await reply(message, extra);
   }
 
+  private async sendHtmlToTarget(target: ChatTarget, message: string, extra?: Record<string, unknown>): Promise<unknown> {
+    return await this.sendHtml(target.chatId, message, {
+      ...(target.messageThreadId ? { message_thread_id: target.messageThreadId } : {}),
+      ...extra,
+    });
+  }
+
   private async sendHtml(chatId: string, message: string, extra?: Record<string, unknown>): Promise<unknown> {
     if (!this.bot) return null;
     return await this.bot.telegram.sendMessage(Number(chatId), message, this.messageOptions(extra));
+  }
+
+  private async sendPlainToTarget(target: ChatTarget, message: string, extra?: Record<string, unknown>): Promise<{ message_id: number } | null> {
+    return await this.sendPlain(target.chatId, message, {
+      ...(target.messageThreadId ? { message_thread_id: target.messageThreadId } : {}),
+      ...extra,
+    });
   }
 
   private async sendPlain(chatId: string, message: string, extra?: Record<string, unknown>): Promise<{ message_id: number } | null> {

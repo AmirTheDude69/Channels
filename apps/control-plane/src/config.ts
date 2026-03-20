@@ -8,6 +8,7 @@ const envSchema = z.object({
   OPENAI_API_KEY: z.string().optional(),
   TELEGRAM_BOT_TOKEN: z.string().optional(),
   TELEGRAM_OWNER_ID: z.string().optional(),
+  TELEGRAM_FORUM_CHAT_ID: z.string().optional(),
   TELEGRAM_WEBHOOK_SECRET: z.string().default('replace-me'),
   PAIR_CODE_TTL_SECONDS: z.coerce.number().int().positive().default(600),
   AGENT_HEARTBEAT_STALE_SECONDS: z.coerce.number().int().positive().default(90),

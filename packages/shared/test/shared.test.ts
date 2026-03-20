@@ -4,6 +4,7 @@ import {
   chunkTelegramMessage,
   classifyThreadProject,
   commandApprovalIsSafe,
+  controlRequestSchema,
   createProjectId,
   effectiveThreadRuntime,
   permissionsAreSafe,
@@ -110,6 +111,20 @@ describe('shared helpers', () => {
     ).toMatchObject({
       model: 'gpt-5.3-codex',
       reasoningEffort: 'xhigh',
+    });
+  });
+
+  it('allows zero readThread limit to request full transcript history', () => {
+    expect(
+      controlRequestSchema.parse({
+        type: 'control.readThread',
+        requestId: 'req_1',
+        threadId: 'thread_1',
+        limitTurns: 0,
+      }),
+    ).toMatchObject({
+      type: 'control.readThread',
+      limitTurns: 0,
     });
   });
 });

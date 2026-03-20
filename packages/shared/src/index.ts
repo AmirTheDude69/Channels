@@ -116,7 +116,7 @@ export const controlRequestNameSchema = z.enum([
 
 export const controlRequestSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('control.listThreads'), requestId: z.string(), projectId: z.string().nullable().optional() }),
-  z.object({ type: z.literal('control.readThread'), requestId: z.string(), threadId: z.string(), limitTurns: z.number().int().positive().max(20).optional() }),
+  z.object({ type: z.literal('control.readThread'), requestId: z.string(), threadId: z.string(), limitTurns: z.number().int().min(0).max(500).optional() }),
   z.object({ type: z.literal('control.getRuntimeCatalog'), requestId: z.string() }),
   z.object({ type: z.literal('control.startThread'), requestId: z.string(), projectId: z.string() }),
   z.object({ type: z.literal('control.resumeThread'), requestId: z.string(), threadId: z.string(), projectId: z.string().nullable().optional() }),

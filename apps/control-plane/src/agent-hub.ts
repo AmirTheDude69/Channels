@@ -119,4 +119,8 @@ export class AgentHub {
   async listThreads(agentId: string, projectId: string | null): Promise<CachedThread[]> {
     return await this.db.listThreads(agentId, projectId);
   }
+
+  async listAllThreads(agentId: string): Promise<CachedThread[]> {
+    return await this.db.listAllThreads(agentId);
+  }
 }

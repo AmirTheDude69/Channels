@@ -34,6 +34,19 @@ export type RunRecord = {
   status: string;
 };
 
+export type ForumMirrorChat = {
+  chatId: string;
+  linkedByTelegramId: string;
+};
+
+export type ForumThreadTopic = {
+  threadId: string;
+  chatId: string;
+  topicId: number;
+  topicName: string;
+  lastMirroredTurnId: string | null;
+};
+
 type ThreadPreferenceRow = {
   thread_id: string;
   plan_mode: boolean;
@@ -59,6 +72,19 @@ type ThreadCacheRow = {
   project_id: string | null;
   legacy: boolean;
   preview: string;
+};
+
+type ForumMirrorChatRow = {
+  chat_id: string;
+  linked_by_telegram_id: string;
+};
+
+type ForumThreadTopicRow = {
+  thread_id: string;
+  chat_id: string;
+  topic_id: number;
+  topic_name: string;
+  last_mirrored_turn_id: string | null;
 };
 
 const createStatements = [
@@ -130,6 +156,21 @@ const createStatements = [
     updated_at timestamptz not null default now(),
     created_at timestamptz not null default now()
   )`,
+  `create table if not exists forum_mirror_chat (
+    scope text primary key default 'global',
+    chat_id text not null,
+    linked_by_telegram_id text not null,
+    updated_at timestamptz not null default now()
+  )`,
+  `create table if not exists forum_thread_topics (
+    thread_id text primary key,
+    chat_id text not null,
+    topic_id integer not null,
+    topic_name text not null,
+    last_mirrored_turn_id text,
+    updated_at timestamptz not null default now(),
+    unique (chat_id, topic_id)
+  )`,
   `create table if not exists audit_log (
     id bigserial primary key,
     actor text not null,
@@ -148,6 +189,8 @@ export class Database {
   private readonly memoryThreads = new Map<string, CachedThread[]>();
   private readonly memoryThreadPreferences = new Map<string, ThreadRuntimePreference>();
   private readonly memoryRuns = new Map<string, RunRecord>();
+  private memoryForumChat: ForumMirrorChat | null = null;
+  private readonly memoryForumTopics = new Map<string, ForumThreadTopic>();
   private readonly memoryAudit: Array<{ actor: string; action: string; metadata: Record<string, unknown> }> = [];
 
   get enabled(): boolean {
@@ -288,6 +331,115 @@ export class Database {
     await this.pool.query(`update chat_sessions set pending_action = $2, pending_payload = $3::jsonb, updated_at = now() where chat_id = $1`, [chatId, action, JSON.stringify(payload)]);
   }
 
+  async getForumMirrorChat(): Promise<ForumMirrorChat | null> {
+    if (!this.pool) {
+      return this.memoryForumChat ? structuredClone(this.memoryForumChat) : null;
+    }
+    const result = await this.pool.query<ForumMirrorChatRow>(`select chat_id, linked_by_telegram_id from forum_mirror_chat where scope = 'global'`);
+    const row = result.rows[0];
+    return row
+      ? {
+          chatId: row.chat_id,
+          linkedByTelegramId: row.linked_by_telegram_id,
+        }
+      : null;
+  }
+
+  async setForumMirrorChat(chatId: string, linkedByTelegramId: string): Promise<ForumMirrorChat> {
+    const saved = { chatId, linkedByTelegramId };
+    if (!this.pool) {
+      this.memoryForumChat = structuredClone(saved);
+      return saved;
+    }
+    const result = await this.pool.query<ForumMirrorChatRow>(
+      `insert into forum_mirror_chat (scope, chat_id, linked_by_telegram_id, updated_at)
+       values ('global', $1, $2, now())
+       on conflict (scope) do update
+       set chat_id = excluded.chat_id,
+           linked_by_telegram_id = excluded.linked_by_telegram_id,
+           updated_at = now()
+       returning chat_id, linked_by_telegram_id`,
+      [chatId, linkedByTelegramId],
+    );
+    return {
+      chatId: result.rows[0].chat_id,
+      linkedByTelegramId: result.rows[0].linked_by_telegram_id,
+    };
+  }
+
+  async getForumThreadTopic(threadId: string): Promise<ForumThreadTopic | null> {
+    if (!this.pool) {
+      return this.memoryForumTopics.get(threadId) ?? null;
+    }
+    const result = await this.pool.query<ForumThreadTopicRow>(
+      `select thread_id, chat_id, topic_id, topic_name, last_mirrored_turn_id from forum_thread_topics where thread_id = $1`,
+      [threadId],
+    );
+    const row = result.rows[0];
+    return row
+      ? {
+          threadId: row.thread_id,
+          chatId: row.chat_id,
+          topicId: row.topic_id,
+          topicName: row.topic_name,
+          lastMirroredTurnId: row.last_mirrored_turn_id,
+        }
+      : null;
+  }
+
+  async findForumThreadTopic(chatId: string, topicId: number): Promise<ForumThreadTopic | null> {
+    if (!this.pool) {
+      for (const topic of this.memoryForumTopics.values()) {
+        if (topic.chatId === chatId && topic.topicId === topicId) {
+          return structuredClone(topic);
+        }
+      }
+      return null;
+    }
+    const result = await this.pool.query<ForumThreadTopicRow>(
+      `select thread_id, chat_id, topic_id, topic_name, last_mirrored_turn_id
+       from forum_thread_topics
+       where chat_id = $1 and topic_id = $2`,
+      [chatId, topicId],
+    );
+    const row = result.rows[0];
+    return row
+      ? {
+          threadId: row.thread_id,
+          chatId: row.chat_id,
+          topicId: row.topic_id,
+          topicName: row.topic_name,
+          lastMirroredTurnId: row.last_mirrored_turn_id,
+        }
+      : null;
+  }
+
+  async upsertForumThreadTopic(topic: ForumThreadTopic): Promise<ForumThreadTopic> {
+    if (!this.pool) {
+      this.memoryForumTopics.set(topic.threadId, structuredClone(topic));
+      return topic;
+    }
+    const result = await this.pool.query<ForumThreadTopicRow>(
+      `insert into forum_thread_topics (thread_id, chat_id, topic_id, topic_name, last_mirrored_turn_id, updated_at)
+       values ($1, $2, $3, $4, $5, now())
+       on conflict (thread_id) do update
+       set chat_id = excluded.chat_id,
+           topic_id = excluded.topic_id,
+           topic_name = excluded.topic_name,
+           last_mirrored_turn_id = excluded.last_mirrored_turn_id,
+           updated_at = now()
+       returning thread_id, chat_id, topic_id, topic_name, last_mirrored_turn_id`,
+      [topic.threadId, topic.chatId, topic.topicId, topic.topicName, topic.lastMirroredTurnId],
+    );
+    return {
+      threadId: result.rows[0].thread_id,
+      chatId: result.rows[0].chat_id,
+      topicId: result.rows[0].topic_id,
+      topicName: result.rows[0].topic_name,
+      lastMirroredTurnId: result.rows[0].last_mirrored_turn_id,
+    };
+  }
+
   async replaceProjects(agentId: string, projects: ProjectRecord[]): Promise<void> {
     if (!this.pool) {
       this.memoryProjects.set(
@@ -388,6 +540,26 @@ export class Database {
           preview: row.preview,
         }
       : null;
+  }
+
+  async listAllThreads(agentId: string): Promise<CachedThread[]> {
+    if (!this.pool) {
+      return structuredClone(this.memoryThreads.get(agentId) ?? []);
+    }
+    const result = await this.pool.query<ThreadCacheRow>(
+      `select * from thread_cache where agent_id = $1 order by updated_at desc`,
+      [agentId],
+    );
+    return result.rows.map((row) => ({
+      threadId: row.thread_id,
+      title: row.title,
+      cwd: row.cwd,
+      updatedAt: Number(row.updated_at),
+      archived: row.archived,
+      projectId: row.project_id,
+      legacy: row.legacy,
+      preview: row.preview,
+    }));
   }
 
   async getThreadPreference(threadId: string): Promise<ThreadRuntimePreference | null> {
