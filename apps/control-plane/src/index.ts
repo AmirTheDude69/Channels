@@ -1,7 +1,7 @@
 import Fastify from 'fastify';
 import websocket from '@fastify/websocket';
-import type { RawData } from 'ws';
 import { randomUUID } from 'node:crypto';
+import type { Update } from 'telegraf/types';
 import { Database } from './db.js';
 import { env, features } from './config.js';
 import { AgentHub } from './agent-hub.js';
@@ -63,10 +63,14 @@ async function main(): Promise<void> {
 
   if (botController.bot) {
     const webhookPath = `/telegram/webhook/${env.TELEGRAM_WEBHOOK_SECRET}`;
-    const callback = botController.bot.webhookCallback(webhookPath);
     app.post(webhookPath, async (request, reply) => {
-      await callback(request.raw, reply.raw);
-      reply.hijack();
+      try {
+        await botController.bot!.handleUpdate(request.body as Update);
+        await reply.code(200).send({ ok: true });
+      } catch (error) {
+        request.log.error({ error }, 'Telegram webhook failed');
+        await reply.code(500).send({ ok: false });
+      }
     });
     if (env.PUBLIC_BASE_URL) {
       try {
