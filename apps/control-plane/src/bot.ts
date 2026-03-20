@@ -55,6 +55,12 @@ type TelegramDocumentContext = NarrowedContext<Context, Types.MountMap['document
 
 type TelegramReply = (message: string, extra?: Record<string, unknown>) => Promise<unknown>;
 
+type ThreadAwareContext = {
+  chat?: Context['chat'];
+  message?: { message_thread_id?: number };
+  callbackQuery?: { message?: unknown };
+};
+
 type ChatTarget = {
   chatId: string;
   messageThreadId: number | null;
@@ -257,6 +263,7 @@ export class BotController {
 
   async handleForumCommand(ctx: TelegramTextContext): Promise<void> {
     const reply = this.replyFromContext(ctx);
+    const target = this.targetFromMessage(ctx.chat.id, ctx.message);
     const forumChatId = await this.getForumMirrorChatId();
 
     if (ctx.chat.type === 'private') {
@@ -268,8 +275,8 @@ export class BotController {
       return;
     }
 
-    if (!this.isForumCompatibleChat(ctx.chat)) {
-      await this.replyHtml(reply, 'This only works in a Telegram supergroup with Topics enabled.');
+    if (ctx.chat.type !== 'supergroup') {
+      await this.sendHtmlToTarget(target, 'This only works in a Telegram supergroup.');
       return;
     }
 
@@ -279,7 +286,30 @@ export class BotController {
       linkedByTelegramId: linked.linkedByTelegramId,
       title: 'title' in ctx.chat ? ctx.chat.title ?? null : null,
     });
-    await this.replyHtml(reply, '<b>Forum mirror linked.</b>\n\nI’ll create one topic per Codex thread here and keep future turns synced.\n\nTo allow normal quick messages inside topics, disable the bot privacy setting in BotFather with <code>/setprivacy</code>.');
+
+    const agentId = this.hub.getConnectedAgentId();
+    if (!agentId) {
+      await this.sendHtmlToTarget(target, '<b>Forum mirror linked.</b>\n\nThe Mac agent is offline right now, so I can’t create topics yet. Once it reconnects, send <code>/forum</code> again.');
+      return;
+    }
+
+    try {
+      const threads = await this.hub.listAllThreads(agentId);
+      if (threads.length > 0) {
+        await this.ensureForumMirrorForThread(agentId, threads[0].threadId);
+      } else if (!this.isForumCompatibleChat(ctx.chat)) {
+        await this.sendHtmlToTarget(target, 'This group still does not look like a Telegram forum yet. Turn on <b>Topics</b>, save the group settings, then send <code>/forum</code> again.');
+        return;
+      }
+    } catch (error) {
+      await this.sendHtmlToTarget(
+        target,
+        `<b>Forum link saved, but topic creation failed.</b>\n\n${plainTextToTelegramHtml(summarizeContextError(error, 'Telegram rejected topic creation.'))}\n\nPlease confirm this is a supergroup with <b>Topics</b> enabled and that the bot still has <b>Manage topics</b>.`,
+      );
+      return;
+    }
+
+    await this.sendHtmlToTarget(target, '<b>Forum mirror linked.</b>\n\nI’m creating one topic per Codex thread here and will keep future turns synced.\n\nTo allow normal quick messages inside topics, disable the bot privacy setting in BotFather with <code>/setprivacy</code>.');
     void this.syncForumMirror(String(ctx.chat.id)).catch((error) => {
       console.error('[forum] initial sync failed', JSON.stringify({ chatId: String(ctx.chat.id), error: serializeError(error) }));
     });
@@ -913,7 +943,8 @@ export class BotController {
 
   private isForumCompatibleChat(chat: Context['chat'] | undefined | null): boolean {
     if (!chat || chat.type !== 'supergroup') return false;
-    return Boolean((chat as Context['chat'] & { is_forum?: boolean }).is_forum);
+    const forumFlag = (chat as Context['chat'] & { is_forum?: boolean }).is_forum;
+    return forumFlag !== false;
   }
 
   private messageThreadIdFromMessage(message: { message_thread_id?: number } | undefined | null): number | null {
@@ -1483,8 +1514,14 @@ export class BotController {
     });
   }
 
-  private replyFromContext(ctx: Pick<Context, 'reply'>): TelegramReply {
-    return async (message, extra) => await ctx.reply(message, this.messageOptions(extra));
+  private replyFromContext(ctx: Pick<Context, 'reply'> & ThreadAwareContext): TelegramReply {
+    return async (message, extra) => {
+      const threadId = this.messageThreadIdFromContext(ctx);
+      return await ctx.reply(message, this.messageOptions({
+        ...(threadId ? { message_thread_id: threadId } : {}),
+        ...extra,
+      }));
+    };
   }
 
   private callbackReplyFromContext(ctx: NarrowedContext<Context, Types.MountMap['callback_query']>): TelegramReply {
@@ -1492,9 +1529,32 @@ export class BotController {
       try {
         return await ctx.editMessageText(message, this.messageOptions(extra));
       } catch {
-        return await ctx.reply(message, this.messageOptions(extra));
+        const threadId = this.messageThreadIdFromContext(ctx);
+        return await ctx.reply(message, this.messageOptions({
+          ...(threadId ? { message_thread_id: threadId } : {}),
+          ...extra,
+        }));
       }
     };
+  }
+
+  private messageThreadIdFromContext(ctx: ThreadAwareContext): number | null {
+    const message = ctx.message;
+    if (typeof message?.message_thread_id === 'number') {
+      return message.message_thread_id;
+    }
+
+    const callbackMessage = ctx.callbackQuery?.message;
+    if (
+      callbackMessage
+      && typeof callbackMessage === 'object'
+      && 'message_thread_id' in callbackMessage
+      && typeof (callbackMessage as { message_thread_id?: unknown }).message_thread_id === 'number'
+    ) {
+      return (callbackMessage as { message_thread_id: number }).message_thread_id;
+    }
+
+    return null;
   }
 
   private async replyHtml(reply: TelegramReply, message: string, extra?: Record<string, unknown>): Promise<unknown> {
