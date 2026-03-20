@@ -15,7 +15,8 @@ import {
 import { env } from './config.js';
 import { CodexAppServerClient, defaultHostname, enrichThreadTitle, normalizeThreadCwd, type JsonRpcMessage } from './codex-app-server.js';
 import { ControlPlaneClient } from './control-plane-client.js';
-import { loadProjects, saveConfig } from './store.js';
+import { loadProjects } from './store.js';
+import { type CodexUiRefreshSettings, refreshCodexDesktopThread } from './ui-refresh.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -43,10 +44,16 @@ export class ChannelsAgent {
   private projects: ProjectRecord[] = [];
   private initialized = false;
   private heartbeatTimer: NodeJS.Timeout | null = null;
+  private readonly uiRefresh: CodexUiRefreshSettings;
 
-  constructor(private readonly serverUrl: string) {
+  constructor(private readonly serverUrl: string, options?: { uiRefresh?: CodexUiRefreshSettings }) {
     this.codex = new CodexAppServerClient(env.CHANNELS_CODEX_APP_SERVER_URL, env.CHANNELS_CODEX_APP_SERVER_PORT);
     this.controlPlane = new ControlPlaneClient(serverUrl);
+    this.uiRefresh = options?.uiRefresh ?? {
+      enabled: false,
+      strategy: 'deeplink-activate',
+      openWhenClosed: false,
+    };
     this.controlPlane.onMessage(async (message) => {
       await this.handleControlMessage(message);
     });
@@ -238,6 +245,7 @@ export class ChannelsAgent {
             input: [{ type: 'text', text: String(message.prompt) }],
           });
           this.controlPlane.sendResponse(request.requestId, true, { accepted: true });
+          void this.maybeRefreshCodexDesktopThread(threadId, 'turn started');
           break;
         }
         case 'control.interruptTurn': {
@@ -285,6 +293,7 @@ export class ChannelsAgent {
       const finalText = assistantTextFromTranscriptTurn(history?.turns.at(-1)) || 'Completed.';
       this.controlPlane.send({ type: 'turn.completed', requestId: active.requestId, threadId: params.threadId, turnId: params.turn.id, finalText });
       this.activeTurns.delete(params.threadId);
+      void this.maybeRefreshCodexDesktopThread(params.threadId, 'turn completed');
       await this.syncAll();
       return;
     }
@@ -440,5 +449,14 @@ export class ChannelsAgent {
       title: coerceThreadTitle(response.thread.name ?? response.thread.title ?? response.thread.preview ?? `Thread ${threadId.slice(0, 8)}`),
       turns,
     };
+  }
+
+  private async maybeRefreshCodexDesktopThread(threadId: string, reason: string): Promise<void> {
+    if (!this.uiRefresh.enabled) return;
+    try {
+      await refreshCodexDesktopThread(threadId, this.uiRefresh);
+    } catch (error) {
+      console.warn(`Codex desktop UI refresh helper failed after ${reason}: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 }

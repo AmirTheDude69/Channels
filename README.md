@@ -38,14 +38,42 @@ After building, install the LaunchAgent so the local companion starts on login:
 node apps/mac-agent/dist/cli.js install --server-url <wss-url>
 ```
 
+If you want the optional desktop refresh helper, turn it on during install:
+
+```bash
+node apps/mac-agent/dist/cli.js install --server-url <wss-url> --ui-refresh --ui-refresh-strategy deeplink-activate
+```
+
 Useful follow-up commands:
 
 ```bash
 node apps/mac-agent/dist/cli.js doctor
 node apps/mac-agent/dist/cli.js run --server-url <wss-url>
+node apps/mac-agent/dist/cli.js refresh-ui --thread-id <thread-id>
 ```
 
 If `launchd` cannot find the Codex binary on your machine, set `CHANNELS_CODEX_BIN` to the full path. The mac-agent also auto-detects common macOS Codex install locations, including `/Applications/Codex.app/Contents/Resources/codex`.
+
+## Optional macOS Desktop Refresh Helper
+
+The Codex desktop app does not expose an official "refresh this open thread UI" API. Channels includes an opt-in, best-effort macOS helper for this using the app's `codex://threads/<threadId>` deep link and, if you choose, AppleScript activation.
+
+- `deeplink`: re-opens the thread in the background without trying to focus Codex
+- `deeplink-activate`: re-opens the thread and brings Codex to the foreground
+- `applescript`: more aggressive AppleScript/System Events focus flow; this is the most fragile option
+
+Defaults and behavior:
+
+- The helper is off by default
+- Even when enabled, it skips refreshes if Codex is closed unless you pass `--open-codex-when-closed`
+- `deeplink-activate` is the recommended starting point
+- `applescript` may need macOS Accessibility permission for `System Events`
+
+You can test the helper manually against a known thread id:
+
+```bash
+node apps/mac-agent/dist/cli.js refresh-ui --thread-id <thread-id> --strategy deeplink-activate
+```
 
 ## Railway Variables
 
