@@ -287,7 +287,12 @@ export class Database {
     for (const project of projects) {
       await this.pool.query(
         `insert into project_cache (agent_id, project_id, name, sandbox_profile, network_enabled)
-         values ($1, $2, $3, $4, $5)`,
+         values ($1, $2, $3, $4, $5)
+         on conflict (agent_id, project_id) do update
+         set name = excluded.name,
+             sandbox_profile = excluded.sandbox_profile,
+             network_enabled = excluded.network_enabled,
+             updated_at = now()`,
         [agentId, project.projectId, project.name, project.sandboxProfile, project.networkEnabled],
       );
     }
@@ -313,7 +318,15 @@ export class Database {
     for (const thread of threads) {
       await this.pool.query(
         `insert into thread_cache (agent_id, thread_id, title, cwd, updated_at, archived, project_id, legacy, preview)
-         values ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         on conflict (agent_id, thread_id) do update
+         set title = excluded.title,
+             cwd = excluded.cwd,
+             updated_at = excluded.updated_at,
+             archived = excluded.archived,
+             project_id = excluded.project_id,
+             legacy = excluded.legacy,
+             preview = excluded.preview`,
         [agentId, thread.threadId, thread.title, thread.cwd, thread.updatedAt, thread.archived, thread.projectId, thread.legacy, thread.preview],
       );
     }

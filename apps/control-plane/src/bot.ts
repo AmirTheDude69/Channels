@@ -34,6 +34,15 @@ type ActiveRunState = {
   lastEditAt: number;
 };
 
+export function applyThreadSelection(session: Pick<ChatSession, 'activeProjectId' | 'activeThreadId'>, thread: CachedThread | null, threadId: string): void {
+  session.activeThreadId = threadId;
+  session.activeProjectId = thread?.projectId ?? null;
+}
+
+export function canRunTurn(session: Pick<ChatSession, 'activeProjectId' | 'activeThreadId'>): boolean {
+  return Boolean(session.activeThreadId || session.activeProjectId);
+}
+
 export class BotController {
   readonly bot: Telegraf<Context> | null;
   private readonly runs = new Map<string, ActiveRunState>();
@@ -171,10 +180,10 @@ export class BotController {
     } else if (data.startsWith('thread:switch:')) {
       const threadId = data.split(':')[2];
       const session = await this.ensureSession(ctx.chat!.id, ctx.from.id);
-      session.activeThreadId = threadId;
-      await this.db.upsertChatSession(session);
       const agentId = this.hub.getConnectedAgentId();
       const thread = agentId ? await this.db.getThread(agentId, threadId) : null;
+      applyThreadSelection(session, thread, threadId);
+      await this.db.upsertChatSession(session);
       await ctx.reply(`Active thread: ${thread?.title ?? threadId}`, thread ? { reply_markup: threadKeyboard(thread) } : undefined);
     } else if (data.startsWith('thread:resume:')) {
       const threadId = data.split(':')[2];
@@ -214,7 +223,7 @@ export class BotController {
     }
 
     let threadId = session.activeThreadId;
-    if (!session.activeProjectId) {
+    if (!canRunTurn(session)) {
       await ctx.reply('Pick a project first from /start.');
       return;
     }
@@ -251,7 +260,7 @@ export class BotController {
         type: 'control.runTurn',
         requestId,
         threadId,
-        projectId: session.activeProjectId,
+        projectId: session.activeProjectId ?? undefined,
         prompt: ctx.message.text,
         chatId: String(ctx.chat.id),
       });
@@ -292,9 +301,9 @@ export class BotController {
       return;
     }
     await this.hub.sendRequest(agentId, { type: 'control.resumeThread', requestId: randomUUID(), threadId, projectId: session.activeProjectId });
-    session.activeThreadId = threadId;
-    await this.db.upsertChatSession(session);
     const thread = await this.db.getThread(agentId, threadId);
+    applyThreadSelection(session, thread, threadId);
+    await this.db.upsertChatSession(session);
     await reply(`Resumed ${thread?.title ?? threadId}`);
   }
 
@@ -306,7 +315,8 @@ export class BotController {
       return;
     }
     const data = (await this.hub.sendRequest(agentId, { type: 'control.forkThread', requestId: randomUUID(), threadId })) as { threadId: string; title: string };
-    session.activeThreadId = data.threadId;
+    const thread = await this.db.getThread(agentId, data.threadId);
+    applyThreadSelection(session, thread, data.threadId);
     await this.db.upsertChatSession(session);
     await reply(`Forked into ${data.title}`);
   }
@@ -319,7 +329,8 @@ export class BotController {
       return;
     }
     await this.hub.sendRequest(agentId, { type: 'control.renameThread', requestId: randomUUID(), threadId, name });
-    session.activeThreadId = threadId;
+    const thread = await this.db.getThread(agentId, threadId);
+    applyThreadSelection(session, thread, threadId);
     await this.db.upsertChatSession(session);
     await reply(`Renamed thread to ${name}`);
   }
