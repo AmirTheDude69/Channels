@@ -491,12 +491,22 @@ export function effectiveThreadRuntime(runtime: RuntimeCatalog, preference?: Par
     runtime.models[0] ??
     null;
   const model = selectedModel?.id ?? preferredModel;
-  const fallbackReasoning = preference?.planMode
-    ? runtime.defaults.planModeReasoningEffort ?? selectedModel?.defaultReasoningEffort ?? runtime.defaults.reasoningEffort ?? 'medium'
-    : selectedModel?.defaultReasoningEffort ?? runtime.defaults.reasoningEffort ?? 'medium';
-  const reasoningEffort = selectedModel?.supportedReasoningEfforts.includes(preference?.reasoningEffort ?? 'medium')
-    ? (preference?.reasoningEffort ?? 'medium')
-    : fallbackReasoning;
+  const supportedReasoningEfforts = selectedModel?.supportedReasoningEfforts ?? [];
+  const supports = (
+    value: ThreadRuntimePreferenceInput['reasoningEffort'] | null | undefined,
+  ): value is NonNullable<ThreadRuntimePreferenceInput['reasoningEffort']> => {
+    if (!value) return false;
+    return supportedReasoningEfforts.length === 0 || supportedReasoningEfforts.includes(value);
+  };
+  const preferredReasoning = preference?.reasoningEffort ?? null;
+  const configReasoning = preference?.planMode
+    ? runtime.defaults.planModeReasoningEffort ?? runtime.defaults.reasoningEffort
+    : runtime.defaults.reasoningEffort;
+  const reasoningEffort =
+    (supports(preferredReasoning) && preferredReasoning) ||
+    (supports(configReasoning) && configReasoning) ||
+    selectedModel?.defaultReasoningEffort ||
+    'medium';
 
   return {
     planMode: preference?.planMode ?? false,

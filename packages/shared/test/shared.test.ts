@@ -5,6 +5,7 @@ import {
   classifyThreadProject,
   commandApprovalIsSafe,
   createProjectId,
+  effectiveThreadRuntime,
   permissionsAreSafe,
   projectRecordSchema,
   transcriptTurnsFromThread,
@@ -81,5 +82,34 @@ describe('shared helpers', () => {
       },
     ]);
     expect(assistantTextFromTranscriptTurn(turns[0])).toBe('First answer');
+  });
+
+  it('prefers configured reasoning defaults over model defaults', () => {
+    expect(
+      effectiveThreadRuntime(
+        {
+          models: [
+            {
+              id: 'gpt-5.3-codex',
+              displayName: 'gpt-5.3-codex',
+              supportedReasoningEfforts: ['low', 'medium', 'high', 'xhigh'],
+              defaultReasoningEffort: 'medium',
+              inputModalities: ['text', 'image'],
+            },
+          ],
+          collaborationModes: ['default', 'plan'],
+          defaults: {
+            model: 'gpt-5.3-codex',
+            reasoningEffort: 'xhigh',
+            planModeReasoningEffort: null,
+            speed: 'normal',
+          },
+        },
+        null,
+      ),
+    ).toMatchObject({
+      model: 'gpt-5.3-codex',
+      reasoningEffort: 'xhigh',
+    });
   });
 });

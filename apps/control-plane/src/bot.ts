@@ -228,16 +228,17 @@ export class BotController {
   async handleCallback(ctx: NarrowedContext<Context, Types.MountMap['callback_query']>, data: string): Promise<void> {
     if (!ctx.from) return;
     const reply = this.replyFromContext(ctx);
+    const editReply = this.callbackReplyFromContext(ctx);
     await this.ensureSession(ctx.chat!.id, ctx.from.id);
 
     if (data === 'ui:projects') {
-      await this.showProjects(ctx.chat!.id, ctx.from.id, reply);
+      await this.showProjects(ctx.chat!.id, ctx.from.id, editReply);
     } else if (data === 'ui:threads') {
-      await this.showThreads(ctx.chat!.id, ctx.from.id, reply);
+      await this.showThreads(ctx.chat!.id, ctx.from.id, editReply);
     } else if (data === 'ui:new-thread') {
-      await this.createNewThread(ctx.chat!.id, ctx.from.id, reply, { announce: true });
+      await this.createNewThread(ctx.chat!.id, ctx.from.id, editReply, { announce: true });
     } else if (data === 'ui:refresh') {
-      await this.renderHome(ctx.chat!.id, ctx.from.id, reply);
+      await this.renderHome(ctx.chat!.id, ctx.from.id, editReply);
     } else if (data === 'ui:pair') {
       await this.issuePairCode(ctx.chat!.id, ctx.from.id, reply);
     } else if (data.startsWith('project:select:')) {
@@ -246,19 +247,18 @@ export class BotController {
       session.activeProjectId = projectId;
       session.activeThreadId = null;
       await this.db.upsertChatSession(session);
-      await this.replyHtml(reply, '<b>Active project updated.</b>');
-      await this.showThreads(ctx.chat!.id, ctx.from.id, reply);
+      await this.showThreads(ctx.chat!.id, ctx.from.id, editReply);
     } else if (data.startsWith('thread:switch:')) {
       const threadId = data.split(':')[2];
-      await this.activateThread(ctx.chat!.id, ctx.from.id, threadId, reply);
-      await this.showThreadHistory(ctx.chat!.id, ctx.from.id, threadId, reply);
+      await this.setActiveThreadSession(ctx.chat!.id, ctx.from.id, threadId, editReply);
+      await this.showActiveThread(ctx.chat!.id, ctx.from.id, editReply);
     } else if (data.startsWith('thread:settings:')) {
       const threadId = data.split(':')[2];
-      await this.activateThread(ctx.chat!.id, ctx.from.id, threadId, reply);
-      await this.showThreadSettings(ctx.chat!.id, ctx.from.id, reply);
+      await this.setActiveThreadSession(ctx.chat!.id, ctx.from.id, threadId, editReply);
+      await this.showThreadSettings(ctx.chat!.id, ctx.from.id, editReply);
     } else if (data.startsWith('thread:resume:')) {
       const threadId = data.split(':')[2];
-      await this.resumeThread(ctx.chat!.id, ctx.from.id, threadId, reply);
+      await this.resumeThread(ctx.chat!.id, ctx.from.id, threadId, editReply);
     } else if (data.startsWith('thread:history:')) {
       const threadId = data.split(':')[2];
       await this.showThreadHistory(ctx.chat!.id, ctx.from.id, threadId, reply);
@@ -271,34 +271,34 @@ export class BotController {
       await this.replyHtml(reply, 'Send the new thread name as your next message.');
     } else if (data.startsWith('thread:archive:')) {
       const threadId = data.split(':')[2];
-      await this.archiveThread(ctx.chat!.id, ctx.from.id, threadId, reply);
+      await this.archiveThread(ctx.chat!.id, ctx.from.id, threadId, editReply);
     } else if (data === 'settings:open') {
-      await this.showThreadSettings(ctx.chat!.id, ctx.from.id, reply);
+      await this.showThreadSettings(ctx.chat!.id, ctx.from.id, editReply);
     } else if (data === 'settings:back') {
-      await this.showActiveThread(ctx.chat!.id, ctx.from.id, reply);
+      await this.showActiveThread(ctx.chat!.id, ctx.from.id, editReply);
     } else if (data === 'settings:toggle-plan') {
-      await this.updateActiveThreadPreference(ctx.chat!.id, ctx.from.id, reply, (current) => ({
+      await this.updateActiveThreadPreference(ctx.chat!.id, ctx.from.id, editReply, (current) => ({
         ...current,
         planMode: !current.planMode,
       }));
     } else if (data === 'settings:toggle-speed') {
-      await this.updateActiveThreadPreference(ctx.chat!.id, ctx.from.id, reply, (current) => ({
+      await this.updateActiveThreadPreference(ctx.chat!.id, ctx.from.id, editReply, (current) => ({
         ...current,
         speed: current.speed === '2x' ? 'normal' : '2x',
       }));
     } else if (data === 'settings:model-menu') {
-      await this.showModelSettings(ctx.chat!.id, ctx.from.id, reply);
+      await this.showModelSettings(ctx.chat!.id, ctx.from.id, editReply);
     } else if (data.startsWith('settings:model:')) {
       const model = data.slice('settings:model:'.length);
-      await this.updateActiveThreadPreference(ctx.chat!.id, ctx.from.id, reply, (current) => ({
+      await this.updateActiveThreadPreference(ctx.chat!.id, ctx.from.id, editReply, (current) => ({
         ...current,
         model,
       }));
     } else if (data === 'settings:reasoning-menu') {
-      await this.showReasoningSettings(ctx.chat!.id, ctx.from.id, reply);
+      await this.showReasoningSettings(ctx.chat!.id, ctx.from.id, editReply);
     } else if (data.startsWith('settings:reasoning:')) {
       const reasoningEffort = data.slice('settings:reasoning:'.length) as ThreadRuntimePreferenceInput['reasoningEffort'];
-      await this.updateActiveThreadPreference(ctx.chat!.id, ctx.from.id, reply, (current) => ({
+      await this.updateActiveThreadPreference(ctx.chat!.id, ctx.from.id, editReply, (current) => ({
         ...current,
         reasoningEffort,
       }));
@@ -453,8 +453,8 @@ export class BotController {
       return;
     }
     await this.hub.sendRequest(agentId, { type: 'control.resumeThread', requestId: randomUUID(), threadId, projectId: session.activeProjectId });
-    await this.activateThread(chatId, telegramUserId, threadId, reply);
-    await this.showThreadHistory(chatId, telegramUserId, threadId, reply);
+    await this.setActiveThreadSession(chatId, telegramUserId, threadId, reply);
+    await this.showActiveThread(chatId, telegramUserId, reply);
   }
 
   async forkThread(chatId: number, telegramUserId: number, threadId: string, reply: TelegramReply): Promise<void> {
@@ -654,7 +654,7 @@ export class BotController {
     }
   }
 
-  private async activateThread(chatId: number, telegramUserId: number, threadId: string, reply: TelegramReply): Promise<void> {
+  private async setActiveThreadSession(chatId: number, telegramUserId: number, threadId: string, reply: TelegramReply): Promise<void> {
     const session = await this.ensureSession(chatId, telegramUserId);
     const agentId = this.hub.getConnectedAgentId();
     if (!agentId) {
@@ -664,7 +664,6 @@ export class BotController {
     const thread = await this.db.getThread(agentId, threadId);
     applyThreadSelection(session, thread, threadId);
     await this.db.upsertChatSession(session);
-    await this.showActiveThread(chatId, telegramUserId, reply);
   }
 
   private async showActiveThread(chatId: number, telegramUserId: number, reply: TelegramReply): Promise<void> {
@@ -900,6 +899,16 @@ export class BotController {
 
   private replyFromContext(ctx: Pick<Context, 'reply'>): TelegramReply {
     return async (message, extra) => await ctx.reply(message, this.messageOptions(extra));
+  }
+
+  private callbackReplyFromContext(ctx: NarrowedContext<Context, Types.MountMap['callback_query']>): TelegramReply {
+    return async (message, extra) => {
+      try {
+        return await ctx.editMessageText(message, this.messageOptions(extra));
+      } catch {
+        return await ctx.reply(message, this.messageOptions(extra));
+      }
+    };
   }
 
   private async replyHtml(reply: TelegramReply, message: string, extra?: Record<string, unknown>): Promise<unknown> {
