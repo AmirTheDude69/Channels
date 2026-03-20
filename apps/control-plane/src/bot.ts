@@ -37,6 +37,7 @@ import {
   threadKeyboard,
   threadsKeyboard,
 } from './telegram-ui.js';
+import { plainTextToTelegramHtml } from './telegram-format.js';
 
 type TelegramTextContext = NarrowedContext<Context, Types.MountMap['text']>;
 type TelegramVoiceContext = NarrowedContext<Context, Types.MountMap['voice']>;
@@ -81,6 +82,35 @@ const TELEGRAM_HTML_OPTIONS = {
   link_preview_options: { is_disabled: true },
 };
 
+function serializeError(error: unknown): Record<string, unknown> {
+  if (error instanceof Error) {
+    const withCause = error as Error & { cause?: unknown; status?: unknown; code?: unknown; type?: unknown; description?: unknown; response?: unknown };
+    return {
+      name: withCause.name,
+      message: withCause.message,
+      stack: withCause.stack ?? null,
+      cause: withCause.cause instanceof Error
+        ? { name: withCause.cause.name, message: withCause.cause.message, stack: withCause.cause.stack ?? null }
+        : withCause.cause ?? null,
+      status: withCause.status ?? null,
+      code: withCause.code ?? null,
+      type: withCause.type ?? null,
+      description: withCause.description ?? null,
+      response: withCause.response ?? null,
+    };
+  }
+
+  return { value: error };
+}
+
+function summarizeContextError(error: unknown, fallback: string): string {
+  if (error instanceof Error && error.message.trim()) {
+    return error.message.trim();
+  }
+
+  return fallback;
+}
+
 export function applyThreadSelection(session: Pick<ChatSession, 'activeProjectId' | 'activeThreadId'>, thread: CachedThread | null, threadId: string): void {
   session.activeThreadId = threadId;
   session.activeProjectId = thread?.projectId ?? null;
@@ -99,6 +129,21 @@ export class BotController {
   constructor(private readonly db: Database, private readonly hub: AgentHub) {
     this.bot = features.hasTelegram ? new Telegraf<Context>(env.TELEGRAM_BOT_TOKEN!) : null;
     if (!this.bot) return;
+
+    this.bot.catch(async (error, ctx) => {
+      console.error('[telegram-update-error]', JSON.stringify({
+        error: serializeError(error),
+        updateType: ctx.updateType,
+        chatId: ctx.chat?.id ?? null,
+        fromId: ctx.from?.id ?? null,
+        callbackData: 'callbackQuery' in ctx && 'data' in (ctx.callbackQuery ?? {}) ? (ctx.callbackQuery as { data?: string }).data ?? null : null,
+        messageId: 'message' in ctx && (ctx.message as { message_id?: number } | undefined)?.message_id ? (ctx.message as { message_id?: number }).message_id : null,
+      }));
+
+      if (ctx.chat?.id && this.bot) {
+        await this.sendPlain(String(ctx.chat.id), 'Something went wrong while processing that Telegram action. Please try again.');
+      }
+    });
 
     this.bot.command('start', async (ctx) => {
       if (!(await this.ensureOwner(ctx))) return;
@@ -342,14 +387,44 @@ export class BotController {
       await this.replyHtml(reply, 'Voice transcription is not configured yet. Set <code>OPENAI_API_KEY</code> on Railway first.');
       return;
     }
-    const file = await this.downloadTelegramFile(ctx.message.voice.file_id, `voice-${ctx.message.voice.file_unique_id}.ogg`);
-    const transcribedText = await this.transcribeAudio(file);
-    await this.startTurn(ctx.chat.id, ctx.from.id, reply, {
-      prompt: transcribedText,
-      transcribedText,
-      attachments: [],
-      attachmentNames: [],
-    });
+    console.info('[voice] received', JSON.stringify({
+      chatId: ctx.chat.id,
+      messageId: ctx.message.message_id,
+      fileSize: ctx.message.voice.file_size ?? null,
+      duration: ctx.message.voice.duration,
+    }));
+    try {
+      const file = await this.downloadTelegramFile(ctx.message.voice.file_id, `voice-${ctx.message.voice.file_unique_id}.ogg`);
+      console.info('[voice] downloaded', JSON.stringify({
+        chatId: ctx.chat.id,
+        messageId: ctx.message.message_id,
+        bytes: file.buffer.length,
+        mediaType: file.mediaType,
+        filename: file.filename,
+      }));
+      const transcribedText = await this.transcribeAudio(file);
+      console.info('[voice] transcribed', JSON.stringify({
+        chatId: ctx.chat.id,
+        messageId: ctx.message.message_id,
+        transcriptLength: transcribedText.length,
+      }));
+      await this.startTurn(ctx.chat.id, ctx.from.id, reply, {
+        prompt: transcribedText,
+        transcribedText,
+        attachments: [],
+        attachmentNames: [],
+      });
+    } catch (error) {
+      console.error('[voice] failed', JSON.stringify({
+        chatId: ctx.chat.id,
+        messageId: ctx.message.message_id,
+        error: serializeError(error),
+      }));
+      await this.replyHtml(
+        reply,
+        `<b>Voice note failed</b>\n\n${plainTextToTelegramHtml(summarizeContextError(error, 'Transcription failed before Codex could start.'))}`,
+      );
+    }
   }
 
   async handleAudio(ctx: TelegramAudioContext): Promise<void> {
@@ -359,14 +434,45 @@ export class BotController {
       await this.replyHtml(reply, 'Audio transcription is not configured yet. Set <code>OPENAI_API_KEY</code> on Railway first.');
       return;
     }
-    const file = await this.downloadTelegramFile(ctx.message.audio.file_id, ctx.message.audio.file_name ?? `audio-${ctx.message.audio.file_unique_id}.m4a`);
-    const transcribedText = await this.transcribeAudio(file);
-    await this.startTurn(ctx.chat.id, ctx.from.id, reply, {
-      prompt: transcribedText,
-      transcribedText,
-      attachments: [],
-      attachmentNames: [],
-    });
+    console.info('[audio] received', JSON.stringify({
+      chatId: ctx.chat.id,
+      messageId: ctx.message.message_id,
+      fileSize: ctx.message.audio.file_size ?? null,
+      duration: ctx.message.audio.duration ?? null,
+      filename: ctx.message.audio.file_name ?? null,
+    }));
+    try {
+      const file = await this.downloadTelegramFile(ctx.message.audio.file_id, ctx.message.audio.file_name ?? `audio-${ctx.message.audio.file_unique_id}.m4a`);
+      console.info('[audio] downloaded', JSON.stringify({
+        chatId: ctx.chat.id,
+        messageId: ctx.message.message_id,
+        bytes: file.buffer.length,
+        mediaType: file.mediaType,
+        filename: file.filename,
+      }));
+      const transcribedText = await this.transcribeAudio(file);
+      console.info('[audio] transcribed', JSON.stringify({
+        chatId: ctx.chat.id,
+        messageId: ctx.message.message_id,
+        transcriptLength: transcribedText.length,
+      }));
+      await this.startTurn(ctx.chat.id, ctx.from.id, reply, {
+        prompt: transcribedText,
+        transcribedText,
+        attachments: [],
+        attachmentNames: [],
+      });
+    } catch (error) {
+      console.error('[audio] failed', JSON.stringify({
+        chatId: ctx.chat.id,
+        messageId: ctx.message.message_id,
+        error: serializeError(error),
+      }));
+      await this.replyHtml(
+        reply,
+        `<b>Audio file failed</b>\n\n${plainTextToTelegramHtml(summarizeContextError(error, 'Transcription failed before Codex could start.'))}`,
+      );
+    }
   }
 
   async handlePhoto(ctx: TelegramPhotoContext): Promise<void> {
@@ -377,41 +483,65 @@ export class BotController {
       await this.replyHtml(reply, 'Telegram did not include a photo payload.');
       return;
     }
-    const file = await this.downloadTelegramFile(photo.file_id, `photo-${photo.file_unique_id}.jpg`);
-    const prompt = (ctx.message.caption ?? '').trim() || 'Please inspect the attached image and help with it.';
-    await this.startTurn(ctx.chat.id, ctx.from.id, reply, {
-      prompt,
-      transcribedText: null,
-      attachmentNames: [file.filename],
-      attachments: [
-        {
-          kind: 'image',
-          filename: file.filename,
-          mediaType: file.mediaType,
-          dataBase64: file.buffer.toString('base64'),
-        },
-      ],
-    });
+    try {
+      const file = await this.downloadTelegramFile(photo.file_id, `photo-${photo.file_unique_id}.jpg`);
+      const prompt = (ctx.message.caption ?? '').trim() || 'Please inspect the attached image and help with it.';
+      await this.startTurn(ctx.chat.id, ctx.from.id, reply, {
+        prompt,
+        transcribedText: null,
+        attachmentNames: [file.filename],
+        attachments: [
+          {
+            kind: 'image',
+            filename: file.filename,
+            mediaType: file.mediaType,
+            dataBase64: file.buffer.toString('base64'),
+          },
+        ],
+      });
+    } catch (error) {
+      console.error('[photo] failed', JSON.stringify({
+        chatId: ctx.chat.id,
+        messageId: ctx.message.message_id,
+        error: serializeError(error),
+      }));
+      await this.replyHtml(
+        reply,
+        `<b>Photo upload failed</b>\n\n${plainTextToTelegramHtml(summarizeContextError(error, 'The image could not be prepared for Codex.'))}`,
+      );
+    }
   }
 
   async handleDocument(ctx: TelegramDocumentContext): Promise<void> {
     if (!ctx.from) return;
     const reply = this.replyFromContext(ctx);
-    const file = await this.downloadTelegramFile(ctx.message.document.file_id, ctx.message.document.file_name ?? `file-${ctx.message.document.file_unique_id}`);
-    const prompt = (ctx.message.caption ?? '').trim() || `Please inspect the attached file ${file.filename} and help with it.`;
-    await this.startTurn(ctx.chat.id, ctx.from.id, reply, {
-      prompt,
-      transcribedText: null,
-      attachmentNames: [file.filename],
-      attachments: [
-        {
-          kind: 'file',
-          filename: file.filename,
-          mediaType: file.mediaType,
-          dataBase64: file.buffer.toString('base64'),
-        },
-      ],
-    });
+    try {
+      const file = await this.downloadTelegramFile(ctx.message.document.file_id, ctx.message.document.file_name ?? `file-${ctx.message.document.file_unique_id}`);
+      const prompt = (ctx.message.caption ?? '').trim() || `Please inspect the attached file ${file.filename} and help with it.`;
+      await this.startTurn(ctx.chat.id, ctx.from.id, reply, {
+        prompt,
+        transcribedText: null,
+        attachmentNames: [file.filename],
+        attachments: [
+          {
+            kind: 'file',
+            filename: file.filename,
+            mediaType: file.mediaType,
+            dataBase64: file.buffer.toString('base64'),
+          },
+        ],
+      });
+    } catch (error) {
+      console.error('[document] failed', JSON.stringify({
+        chatId: ctx.chat.id,
+        messageId: ctx.message.message_id,
+        error: serializeError(error),
+      }));
+      await this.replyHtml(
+        reply,
+        `<b>File upload failed</b>\n\n${plainTextToTelegramHtml(summarizeContextError(error, 'The file could not be prepared for Codex.'))}`,
+      );
+    }
   }
 
   async createNewThread(
@@ -769,12 +899,38 @@ export class BotController {
 
     const requestId = randomUUID();
     const runId = randomUUID();
-    const pending = (await this.replyHtml(reply, formatRunWorkingState({
-      threadTitle,
-      activityLines: [],
-      transcribedText: args.transcribedText,
-      attachmentNames: args.attachmentNames,
-    }), { reply_markup: activeRunKeyboard(runId) })) as { message_id: number };
+    let pendingMessageId: number | null = null;
+    try {
+      const pending = (await this.replyHtml(reply, formatRunWorkingState({
+        threadTitle,
+        activityLines: [],
+        transcribedText: args.transcribedText,
+        attachmentNames: args.attachmentNames,
+      }), { reply_markup: activeRunKeyboard(runId) })) as { message_id?: number } | undefined;
+      pendingMessageId = typeof pending?.message_id === 'number' ? pending.message_id : null;
+    } catch (error) {
+      console.error('[turn] failed to send working message', JSON.stringify({
+        chatId,
+        threadId,
+        requestId,
+        hasTranscription: Boolean(args.transcribedText),
+        attachmentCount: args.attachmentNames.length,
+        error: serializeError(error),
+      }));
+      const fallbackText = args.transcribedText
+        ? `Transcribed voice note:\n${args.transcribedText}\n\nWorking on it...`
+        : 'Working on it...';
+      const pending = await this.sendPlain(String(chatId), fallbackText, { reply_markup: activeRunKeyboard(runId) }).catch((fallbackError) => {
+        console.error('[turn] failed to send fallback working message', JSON.stringify({
+          chatId,
+          threadId,
+          requestId,
+          error: serializeError(fallbackError),
+        }));
+        return null;
+      });
+      pendingMessageId = pending?.message_id ?? null;
+    }
 
     this.approvalChatByRequest.set(requestId, String(chatId));
     this.runs.set(requestId, {
@@ -783,7 +939,7 @@ export class BotController {
       threadId,
       requestId,
       turnId: null,
-      telegramMessageId: pending.message_id,
+      telegramMessageId: pendingMessageId,
       buffer: '',
       lastEditAt: 0,
       activityLines: [],
@@ -798,7 +954,7 @@ export class BotController {
       threadId,
       requestId,
       turnId: null,
-      telegramMessageId: pending.message_id,
+      telegramMessageId: pendingMessageId,
       status: 'running',
     };
     await this.db.upsertRun(runRecord);
@@ -816,7 +972,12 @@ export class BotController {
       });
     } catch (error) {
       this.runs.delete(requestId);
-      await this.editHtml(String(chatId), pending.message_id, `<b>Failed to start turn</b>\n\n${String((error as Error).message || error)}`).catch(() => undefined);
+      const message = `<b>Failed to start turn</b>\n\n${plainTextToTelegramHtml(summarizeContextError(error, 'Codex did not accept the turn.'))}`;
+      if (pendingMessageId) {
+        await this.editHtml(String(chatId), pendingMessageId, message).catch(() => undefined);
+      } else {
+        await this.sendHtml(String(chatId), message).catch(() => undefined);
+      }
     }
   }
 
@@ -918,6 +1079,14 @@ export class BotController {
   private async sendHtml(chatId: string, message: string, extra?: Record<string, unknown>): Promise<unknown> {
     if (!this.bot) return null;
     return await this.bot.telegram.sendMessage(Number(chatId), message, this.messageOptions(extra));
+  }
+
+  private async sendPlain(chatId: string, message: string, extra?: Record<string, unknown>): Promise<{ message_id: number } | null> {
+    if (!this.bot) return null;
+    return await this.bot.telegram.sendMessage(Number(chatId), message, {
+      link_preview_options: { is_disabled: true },
+      ...extra,
+    }) as { message_id: number };
   }
 
   private async editHtml(chatId: string, messageId: number, message: string, extra?: Record<string, unknown>): Promise<unknown> {

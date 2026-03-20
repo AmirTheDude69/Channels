@@ -13,6 +13,26 @@ const db = new Database();
 let botController: BotController;
 let hub: AgentHub;
 
+function serializeError(error: unknown): Record<string, unknown> {
+  if (error instanceof Error) {
+    const withCause = error as Error & { cause?: unknown; status?: unknown; code?: unknown; type?: unknown; description?: unknown };
+    return {
+      name: withCause.name,
+      message: withCause.message,
+      stack: withCause.stack ?? null,
+      cause: withCause.cause instanceof Error
+        ? { name: withCause.cause.name, message: withCause.cause.message, stack: withCause.cause.stack ?? null }
+        : withCause.cause ?? null,
+      status: withCause.status ?? null,
+      code: withCause.code ?? null,
+      type: withCause.type ?? null,
+      description: withCause.description ?? null,
+    };
+  }
+
+  return { value: error };
+}
+
 async function main(): Promise<void> {
   await db.init();
   await app.register(websocket);
@@ -68,7 +88,7 @@ async function main(): Promise<void> {
         await botController.bot!.handleUpdate(request.body as Update);
         await reply.code(200).send({ ok: true });
       } catch (error) {
-        request.log.error({ error }, 'Telegram webhook failed');
+        request.log.error({ error: serializeError(error) }, 'Telegram webhook failed');
         await reply.code(500).send({ ok: false });
       }
     });
