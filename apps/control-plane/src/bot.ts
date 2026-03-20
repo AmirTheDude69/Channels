@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { File as NodeFile } from 'node:buffer';
 import path from 'node:path';
 import OpenAI, { toFile } from 'openai';
 import { Telegraf } from 'telegraf';
@@ -81,6 +82,10 @@ const TELEGRAM_HTML_OPTIONS = {
   parse_mode: 'HTML' as const,
   link_preview_options: { is_disabled: true },
 };
+
+if (typeof globalThis.File === 'undefined') {
+  globalThis.File = NodeFile as unknown as typeof globalThis.File;
+}
 
 function serializeError(error: unknown): Record<string, unknown> {
   if (error instanceof Error) {
