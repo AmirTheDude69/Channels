@@ -6,12 +6,14 @@ import type { AgentHub } from './agent-hub.js';
 import { env, features } from './config.js';
 import {
   type CachedThread,
+  type TranscriptTurn,
   chunkTelegramMessage,
   createPairCode,
   summarizeApprovalKind,
 } from '@channels/shared';
 import {
   activeRunKeyboard,
+  formatThreadHistory,
   formatProjectsList,
   formatStartMessage,
   formatThreadList,
@@ -185,9 +187,13 @@ export class BotController {
       applyThreadSelection(session, thread, threadId);
       await this.db.upsertChatSession(session);
       await ctx.reply(`Active thread: ${thread?.title ?? threadId}`, thread ? { reply_markup: threadKeyboard(thread) } : undefined);
+      await this.showThreadHistory(ctx.chat!.id, ctx.from.id, threadId, ctx.reply.bind(ctx));
     } else if (data.startsWith('thread:resume:')) {
       const threadId = data.split(':')[2];
       await this.resumeThread(ctx.chat!.id, ctx.from.id, threadId, ctx.reply.bind(ctx));
+    } else if (data.startsWith('thread:history:')) {
+      const threadId = data.split(':')[2];
+      await this.showThreadHistory(ctx.chat!.id, ctx.from.id, threadId, ctx.reply.bind(ctx));
     } else if (data.startsWith('thread:fork:')) {
       const threadId = data.split(':')[2];
       await this.forkThread(ctx.chat!.id, ctx.from.id, threadId, ctx.reply.bind(ctx));
@@ -310,6 +316,7 @@ export class BotController {
     applyThreadSelection(session, thread, threadId);
     await this.db.upsertChatSession(session);
     await reply(`Resumed ${thread?.title ?? threadId}`);
+    await this.showThreadHistory(chatId, telegramUserId, threadId, reply);
   }
 
   async forkThread(chatId: number, telegramUserId: number, threadId: string, reply: (message: string) => Promise<unknown>): Promise<void> {
@@ -374,6 +381,34 @@ export class BotController {
     }
     this.hub.send(agentId, { type: 'approval.decision', approvalRequestId, codexRequestId: approvalRequestId, decision });
     await reply(`Approval decision sent: ${decision}`);
+  }
+
+  async showThreadHistory(
+    chatId: number,
+    telegramUserId: number,
+    threadId: string,
+    reply: (message: string) => Promise<unknown>,
+    limitTurns = 3,
+  ): Promise<void> {
+    await this.ensureSession(chatId, telegramUserId);
+    const agentId = this.hub.getConnectedAgentId();
+    if (!agentId) {
+      await reply('Mac companion is offline.');
+      return;
+    }
+
+    const thread = await this.db.getThread(agentId, threadId);
+    const data = (await this.hub.sendRequest(agentId, {
+      type: 'control.readThread',
+      requestId: randomUUID(),
+      threadId,
+      limitTurns,
+    })) as { threadId: string; title: string; turns: TranscriptTurn[] };
+
+    const text = formatThreadHistory(data.title ?? thread?.title ?? threadId, data.turns);
+    for (const chunk of chunkTelegramMessage(text)) {
+      await reply(chunk);
+    }
   }
 
   async onAgentMessage(agentId: string, message: { type: string; [key: string]: unknown }): Promise<void> {

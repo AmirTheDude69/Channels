@@ -27,8 +27,23 @@ export const cachedThreadSchema = z.object({
 
 export type CachedThread = z.infer<typeof cachedThreadSchema>;
 
+export const transcriptEntrySchema = z.object({
+  role: z.enum(['user', 'assistant']),
+  text: z.string().min(1),
+});
+
+export type TranscriptEntry = z.infer<typeof transcriptEntrySchema>;
+
+export const transcriptTurnSchema = z.object({
+  turnId: z.string(),
+  entries: z.array(transcriptEntrySchema),
+});
+
+export type TranscriptTurn = z.infer<typeof transcriptTurnSchema>;
+
 export const controlRequestNameSchema = z.enum([
   'control.listThreads',
+  'control.readThread',
   'control.startThread',
   'control.resumeThread',
   'control.forkThread',
@@ -40,6 +55,7 @@ export const controlRequestNameSchema = z.enum([
 
 export const controlRequestSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('control.listThreads'), requestId: z.string(), projectId: z.string().nullable().optional() }),
+  z.object({ type: z.literal('control.readThread'), requestId: z.string(), threadId: z.string(), limitTurns: z.number().int().positive().max(20).optional() }),
   z.object({ type: z.literal('control.startThread'), requestId: z.string(), projectId: z.string() }),
   z.object({ type: z.literal('control.resumeThread'), requestId: z.string(), threadId: z.string(), projectId: z.string().nullable().optional() }),
   z.object({ type: z.literal('control.forkThread'), requestId: z.string(), threadId: z.string() }),
@@ -265,6 +281,83 @@ export function chunkTelegramMessage(text: string, limit = 3800): string[] {
   }
   if (remaining.length > 0) chunks.push(remaining);
   return chunks;
+}
+
+type LooseThreadItem = {
+  type?: string | null;
+  text?: string | null;
+  content?: Array<{ type?: string | null; text?: string | null } | null> | null;
+};
+
+type LooseThreadTurn = {
+  id?: string | null;
+  items?: Array<LooseThreadItem | null> | null;
+};
+
+function normalizeTranscriptText(text: string): string {
+  return text.replace(/\r\n/g, '\n').trim();
+}
+
+function textFromContent(
+  content: Array<{ type?: string | null; text?: string | null } | null> | null | undefined,
+): string {
+  return (content ?? [])
+    .map((entry) => normalizeTranscriptText(entry?.text ?? ''))
+    .filter(Boolean)
+    .join('\n\n');
+}
+
+export function transcriptEntriesFromItems(items: Array<LooseThreadItem | null> | null | undefined): TranscriptEntry[] {
+  const entries: TranscriptEntry[] = [];
+
+  for (const item of items ?? []) {
+    if (!item) continue;
+
+    const itemType = (item.type ?? '').toLowerCase();
+    const text = normalizeTranscriptText(item.text ?? '') || textFromContent(item.content);
+    if (!text) continue;
+
+    if (itemType === 'usermessage' || itemType.startsWith('user')) {
+      entries.push({ role: 'user', text });
+      continue;
+    }
+
+    if (itemType === 'agentmessage' || itemType.startsWith('agent')) {
+      entries.push({ role: 'assistant', text });
+    }
+  }
+
+  return entries;
+}
+
+export function transcriptTurnFromTurn(turn: LooseThreadTurn | null | undefined): TranscriptTurn | null {
+  if (!turn?.id) return null;
+  const entries = transcriptEntriesFromItems(turn.items);
+  if (entries.length === 0) return null;
+  return { turnId: turn.id, entries };
+}
+
+export function transcriptTurnsFromThread(
+  turns: Array<LooseThreadTurn | null> | null | undefined,
+  limitTurns?: number,
+): TranscriptTurn[] {
+  const normalized = (turns ?? [])
+    .map((turn) => transcriptTurnFromTurn(turn))
+    .filter((turn): turn is TranscriptTurn => Boolean(turn));
+
+  if (!limitTurns || limitTurns >= normalized.length) {
+    return normalized;
+  }
+
+  return normalized.slice(-limitTurns);
+}
+
+export function assistantTextFromTranscriptTurn(turn: TranscriptTurn | null | undefined): string {
+  return (turn?.entries ?? [])
+    .filter((entry) => entry.role === 'assistant')
+    .map((entry) => entry.text)
+    .join('\n\n')
+    .trim();
 }
 
 export function summarizeApprovalKind(kind: 'command' | 'fileChange' | 'permissions' | 'toolInput'): string {

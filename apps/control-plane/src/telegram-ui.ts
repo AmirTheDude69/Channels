@@ -1,4 +1,4 @@
-import type { CachedThread } from '@channels/shared';
+import type { CachedThread, TranscriptTurn } from '@channels/shared';
 
 export function rootKeyboard(): { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> } {
   return {
@@ -27,7 +27,10 @@ export function threadKeyboard(thread: CachedThread): { inline_keyboard: Array<A
         { text: 'Rename', callback_data: `thread:rename:${thread.threadId}` },
         { text: 'Archive', callback_data: `thread:archive:${thread.threadId}` },
       ],
-      [{ text: 'Switch', callback_data: `thread:switch:${thread.threadId}` }],
+      [
+        { text: 'History', callback_data: `thread:history:${thread.threadId}` },
+        { text: 'Switch', callback_data: `thread:switch:${thread.threadId}` },
+      ],
     ],
   };
 }
@@ -80,6 +83,24 @@ export function formatThreadList(threads: CachedThread[], activeThreadId?: strin
     lines.push(`${marker} ${thread.title}${legacy}`);
   }
   return lines.join('\n');
+}
+
+export function formatThreadHistory(title: string, turns: TranscriptTurn[]): string {
+  if (turns.length === 0) {
+    return `No saved history yet for ${title}.`;
+  }
+
+  const lines = [`Recent history for ${title}`];
+  for (const turn of turns) {
+    lines.push('');
+    for (const entry of turn.entries) {
+      lines.push(entry.role === 'user' ? 'User:' : 'Codex:');
+      lines.push(entry.text);
+      lines.push('');
+    }
+  }
+
+  return lines.join('\n').trim();
 }
 
 export function threadsKeyboard(threads: CachedThread[]): { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> } {

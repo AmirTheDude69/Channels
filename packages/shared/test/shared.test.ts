@@ -1,11 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import {
+  assistantTextFromTranscriptTurn,
   chunkTelegramMessage,
   classifyThreadProject,
   commandApprovalIsSafe,
   createProjectId,
   permissionsAreSafe,
   projectRecordSchema,
+  transcriptTurnsFromThread,
 } from '../src/index.js';
 
 describe('shared helpers', () => {
@@ -56,5 +58,28 @@ describe('shared helpers', () => {
         networkEnabled: false,
       }),
     ).toBe(false);
+  });
+
+  it('extracts transcript turns from Codex thread items', () => {
+    const turns = transcriptTurnsFromThread([
+      {
+        id: 'turn_1',
+        items: [
+          { type: 'userMessage', content: [{ type: 'text', text: 'First question' }] },
+          { type: 'agentMessage', text: 'First answer' },
+        ],
+      },
+    ]);
+
+    expect(turns).toEqual([
+      {
+        turnId: 'turn_1',
+        entries: [
+          { role: 'user', text: 'First question' },
+          { role: 'assistant', text: 'First answer' },
+        ],
+      },
+    ]);
+    expect(assistantTextFromTranscriptTurn(turns[0])).toBe('First answer');
   });
 });

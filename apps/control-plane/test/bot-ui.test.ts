@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { activeRunKeyboard, formatThreadList, rootKeyboard, threadKeyboard } from '../src/telegram-ui.js';
+import { activeRunKeyboard, formatThreadHistory, formatThreadList, rootKeyboard, threadKeyboard } from '../src/telegram-ui.js';
 import { applyThreadSelection, canRunTurn } from '../src/bot.js';
 
 describe('telegram ui', () => {
@@ -38,8 +38,20 @@ describe('telegram ui', () => {
         projectId: 'p1',
         legacy: false,
         preview: '',
-      }).inline_keyboard.flat().map((item) => item.text),
+        }).inline_keyboard.flat().map((item) => item.text),
     ).toContain('Fork');
+    expect(
+      threadKeyboard({
+        threadId: 'thr_1',
+        title: 'Alpha',
+        cwd: '/tmp',
+        updatedAt: 1,
+        archived: false,
+        projectId: 'p1',
+        legacy: false,
+        preview: '',
+      }).inline_keyboard.flat().map((item) => item.text),
+    ).toContain('History');
   });
 
   it('keeps stop callback payloads within Telegram limits', () => {
@@ -89,5 +101,19 @@ describe('telegram ui', () => {
     expect(session.activeProjectId).toBe('project-2');
     expect(session.activeThreadId).toBe('thr_project');
     expect(canRunTurn(session)).toBe(true);
+  });
+
+  it('formats transcript history for telegram', () => {
+    expect(
+      formatThreadHistory('Alpha', [
+        {
+          turnId: 'turn_1',
+          entries: [
+            { role: 'user', text: 'Hello' },
+            { role: 'assistant', text: 'Hi there' },
+          ],
+        },
+      ]),
+    ).toContain('Codex:\nHi there');
   });
 });

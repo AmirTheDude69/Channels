@@ -1,7 +1,17 @@
 import { randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { type CachedThread, classifyThreadProject, coerceThreadTitle, permissionsAreSafe, commandApprovalIsSafe, type ProjectRecord } from '@channels/shared';
+import {
+  type CachedThread,
+  type TranscriptTurn,
+  assistantTextFromTranscriptTurn,
+  classifyThreadProject,
+  coerceThreadTitle,
+  commandApprovalIsSafe,
+  permissionsAreSafe,
+  type ProjectRecord,
+  transcriptTurnsFromThread,
+} from '@channels/shared';
 import { env } from './config.js';
 import { CodexAppServerClient, defaultHostname, enrichThreadTitle, normalizeThreadCwd, type JsonRpcMessage } from './codex-app-server.js';
 import { ControlPlaneClient } from './control-plane-client.js';
@@ -159,6 +169,11 @@ export class ChannelsAgent {
           });
           break;
         }
+        case 'control.readThread': {
+          const history = await this.readThreadHistory(String(message.threadId), Number(message.limitTurns ?? 4));
+          this.controlPlane.sendResponse(request.requestId, true, history);
+          break;
+        }
         case 'control.startThread': {
           const project = this.requireProject(String(message.projectId));
           const result = (await this.codex.request('thread/start', {
@@ -168,6 +183,7 @@ export class ChannelsAgent {
             personality: 'friendly',
             model: 'gpt-5.4',
             serviceName: 'channels-mac-agent',
+            persistExtendedHistory: true,
           })) as { thread: { id: string; title?: string | null } };
           await this.syncAll();
           this.controlPlane.sendResponse(request.requestId, true, {
@@ -180,6 +196,7 @@ export class ChannelsAgent {
           const result = (await this.codex.request('thread/resume', {
             threadId: String(message.threadId),
             personality: 'friendly',
+            persistExtendedHistory: true,
           })) as { thread: { id: string; title?: string | null } };
           await this.syncAll();
           this.controlPlane.sendResponse(request.requestId, true, { threadId: result.thread.id, title: coerceThreadTitle(result.thread.title ?? 'Thread') });
@@ -189,6 +206,7 @@ export class ChannelsAgent {
           const result = (await this.codex.request('thread/fork', {
             threadId: String(message.threadId),
             approvalPolicy: 'on-request',
+            persistExtendedHistory: true,
           })) as { thread: { id: string; title?: string | null } };
           await this.syncAll();
           this.controlPlane.sendResponse(request.requestId, true, { threadId: result.thread.id, title: coerceThreadTitle(result.thread.title ?? 'Forked thread') });
@@ -209,7 +227,7 @@ export class ChannelsAgent {
         case 'control.runTurn': {
           const threadId = String(message.threadId);
           const project = message.projectId ? this.projects.find((item) => item.projectId === String(message.projectId)) ?? null : null;
-          await this.codex.request('thread/resume', { threadId, personality: 'friendly' }).catch(() => undefined);
+          await this.codex.request('thread/resume', { threadId, personality: 'friendly', persistExtendedHistory: true }).catch(() => undefined);
           this.activeTurns.set(threadId, { requestId: request.requestId, threadId, projectId: project?.projectId ?? null, turnId: null });
           await this.codex.request('turn/start', {
             threadId,
@@ -260,10 +278,11 @@ export class ChannelsAgent {
       return;
     }
     if (message.method === 'turn/completed') {
-      const params = message.params as { threadId: string; turn: { id: string; items?: Array<{ type?: string; text?: string; content?: Array<{ text?: string }> }> } };
+      const params = message.params as { threadId: string; turn: { id: string } };
       const active = this.activeTurns.get(params.threadId);
       if (!active) return;
-      const finalText = this.extractFinalText(params.turn.items ?? []);
+      const history = await this.readThreadHistory(params.threadId, 1, params.turn.id).catch(() => null);
+      const finalText = assistantTextFromTranscriptTurn(history?.turns.at(-1)) || 'Completed.';
       this.controlPlane.send({ type: 'turn.completed', requestId: active.requestId, threadId: params.threadId, turnId: params.turn.id, finalText });
       this.activeTurns.delete(params.threadId);
       await this.syncAll();
@@ -396,14 +415,30 @@ export class ChannelsAgent {
     return project;
   }
 
-  private extractFinalText(items: Array<{ type?: string; text?: string; content?: Array<{ text?: string }> }>): string {
-    for (const item of items.slice().reverse()) {
-      if (item.type?.toLowerCase().includes('agent') && item.text) {
-        return item.text;
-      }
-      const contentText = item.content?.map((entry) => entry.text).filter(Boolean).join('\n');
-      if (contentText) return contentText;
-    }
-    return 'Completed.';
+  private async readThreadHistory(threadId: string, limitTurns = 4, preferredTurnId?: string): Promise<{ threadId: string; title: string; turns: TranscriptTurn[] }> {
+    const response = (await this.codex.request('thread/read', {
+      threadId,
+      includeTurns: true,
+    })) as {
+      thread: {
+        id: string;
+        name?: string | null;
+        title?: string | null;
+        preview?: string | null;
+        turns?: Array<{ id?: string | null; items?: Array<{ type?: string | null; text?: string | null; content?: Array<{ type?: string | null; text?: string | null } | null> | null } | null> | null } | null>;
+      };
+    };
+
+    const allTurns = transcriptTurnsFromThread(response.thread.turns ?? []);
+    const selectedTurns = preferredTurnId
+      ? allTurns.filter((turn) => turn.turnId === preferredTurnId)
+      : [];
+    const turns = selectedTurns.length > 0 ? selectedTurns : (limitTurns > 0 ? allTurns.slice(-limitTurns) : allTurns);
+
+    return {
+      threadId: response.thread.id,
+      title: coerceThreadTitle(response.thread.name ?? response.thread.title ?? response.thread.preview ?? `Thread ${threadId.slice(0, 8)}`),
+      turns,
+    };
   }
 }
