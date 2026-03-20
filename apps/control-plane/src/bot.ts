@@ -1033,7 +1033,7 @@ export class BotController {
     }
     const arrayBuffer = await response.arrayBuffer();
     return {
-      filename: path.basename(file.file_path) || fallbackFilename,
+      filename: path.basename(fallbackFilename) || path.basename(file.file_path) || 'attachment',
       mediaType: response.headers.get('content-type') ?? 'application/octet-stream',
       buffer: Buffer.from(arrayBuffer),
     };
