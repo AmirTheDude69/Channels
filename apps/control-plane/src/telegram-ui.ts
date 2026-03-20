@@ -32,9 +32,9 @@ export function threadKeyboard(thread: CachedThread): { inline_keyboard: Array<A
   };
 }
 
-export function activeRunKeyboard(threadId: string, turnId: string): { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> } {
+export function activeRunKeyboard(runId: string): { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> } {
   return {
-    inline_keyboard: [[{ text: 'Stop', callback_data: `turn:stop:${threadId}:${turnId}` }]],
+    inline_keyboard: [[{ text: 'Stop', callback_data: `turn:stop:${runId}` }]],
   };
 }
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { formatThreadList, rootKeyboard, threadKeyboard } from '../src/telegram-ui.js';
+import { activeRunKeyboard, formatThreadList, rootKeyboard, threadKeyboard } from '../src/telegram-ui.js';
 import { applyThreadSelection, canRunTurn } from '../src/bot.js';
 
 describe('telegram ui', () => {
@@ -40,6 +40,11 @@ describe('telegram ui', () => {
         preview: '',
       }).inline_keyboard.flat().map((item) => item.text),
     ).toContain('Fork');
+  });
+
+  it('keeps stop callback payloads within Telegram limits', () => {
+    const callbackData = activeRunKeyboard('run_1234567890').inline_keyboard[0][0].callback_data;
+    expect(callbackData?.length ?? 0).toBeLessThanOrEqual(64);
   });
 
   it('lets legacy thread selections run without a project', () => {

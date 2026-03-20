@@ -199,8 +199,13 @@ export class BotController {
       const threadId = data.split(':')[2];
       await this.archiveThread(ctx.chat!.id, ctx.from.id, threadId, ctx.reply.bind(ctx));
     } else if (data.startsWith('turn:stop:')) {
-      const [, , threadId, turnId] = data.split(':');
-      await this.stopTurn(ctx.chat!.id, ctx.from.id, threadId, turnId, ctx.reply.bind(ctx));
+      const runId = data.split(':')[2];
+      const run = Array.from(this.runs.values()).find((entry) => entry.runId === runId);
+      if (!run?.turnId) {
+        await ctx.reply('This run is no longer active.');
+      } else {
+        await this.stopTurn(ctx.chat!.id, ctx.from.id, run.threadId, run.turnId, ctx.reply.bind(ctx));
+      }
     } else if (data.startsWith('approval:')) {
       const [, approvalRequestId, decision] = data.split(':');
       await this.resolveApproval(approvalRequestId, decision as 'accept' | 'decline' | 'cancel', ctx.reply.bind(ctx));
@@ -388,7 +393,7 @@ export class BotController {
         });
         if (run.telegramMessageId) {
           await this.bot.telegram.editMessageText(Number(run.chatId), run.telegramMessageId, undefined, 'Working on it...', {
-            reply_markup: activeRunKeyboard(run.threadId, run.turnId),
+            reply_markup: activeRunKeyboard(run.runId),
           });
         }
       }
@@ -403,7 +408,7 @@ export class BotController {
         run.lastEditAt = Date.now();
         const preview = chunkTelegramMessage(run.buffer, 3500)[0] || 'Working...';
         await this.bot.telegram.editMessageText(Number(run.chatId), run.telegramMessageId, undefined, preview, {
-          reply_markup: run.turnId ? activeRunKeyboard(run.threadId, run.turnId) : undefined,
+          reply_markup: run.turnId ? activeRunKeyboard(run.runId) : undefined,
         }).catch(() => undefined);
       }
       return;
