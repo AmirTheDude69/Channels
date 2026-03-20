@@ -40,7 +40,7 @@ function renderInlineMarkdown(text: string): string {
 }
 
 function renderParagraph(lines: string[]): string {
-  return lines.map((line) => renderInlineMarkdown(line)).join('<br/>');
+  return lines.map((line) => renderInlineMarkdown(line)).join('\n');
 }
 
 function renderCodeBlock(lines: string[]): string {
@@ -48,7 +48,7 @@ function renderCodeBlock(lines: string[]): string {
 }
 
 function renderBlockquote(lines: string[]): string {
-  return `<blockquote>${lines.map((line) => renderInlineMarkdown(line)).join('<br/>')}</blockquote>`;
+  return `<blockquote>${lines.map((line) => renderInlineMarkdown(line)).join('\n')}</blockquote>`;
 }
 
 function renderList(lines: string[], ordered: boolean): string {
@@ -57,7 +57,7 @@ function renderList(lines: string[], ordered: boolean): string {
       const prefix = ordered ? `${index + 1}. ` : '• ';
       return `${prefix}${renderInlineMarkdown(line)}`;
     })
-    .join('<br/>');
+    .join('\n');
 }
 
 export function markdownToTelegramBlocks(markdown: string): string[] {
@@ -201,5 +201,5 @@ export function markdownToTelegramHtml(markdown: string): string {
 }
 
 export function plainTextToTelegramHtml(text: string): string {
-  return escapeTelegramHtml(text).replace(/\r\n/g, '\n').replace(/\n/g, '<br/>');
+  return escapeTelegramHtml(text).replace(/\r\n/g, '\n');
 }

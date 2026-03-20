@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { activeRunKeyboard, formatThreadHistory, formatThreadList, rootKeyboard, settingsKeyboard, threadKeyboard } from '../src/telegram-ui.js';
+import { plainTextToTelegramHtml } from '../src/telegram-format.js';
 import { applyThreadSelection, canRunTurn } from '../src/bot.js';
 
 describe('telegram ui', () => {
@@ -130,5 +131,20 @@ describe('telegram ui', () => {
         expect.stringContaining('<b>Codex</b>'),
       ]),
     );
+  });
+
+  it('does not emit unsupported br tags in telegram html', () => {
+    expect(plainTextToTelegramHtml('line one\nline two')).not.toContain('<br');
+    expect(
+      formatThreadHistory('Alpha', [
+        {
+          turnId: 'turn_1',
+          entries: [
+            { role: 'user', text: 'Hello\nthere' },
+            { role: 'assistant', text: 'Paragraph one\nParagraph two' },
+          ],
+        },
+      ]).join('\n\n'),
+    ).not.toContain('<br');
   });
 });
