@@ -1,0 +1,24 @@
+{
+  "name": "@channels/control-plane",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsup src/index.ts --format esm --dts",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@channels/shared": "workspace:*",
+    "@fastify/websocket": "^11.2.0",
+    "dotenv": "^17.2.2",
+    "fastify": "^5.6.0",
+    "pg": "^8.16.3",
+    "telegraf": "^4.16.3",
+    "ws": "^8.18.3",
+    "zod": "^4.1.11"
+  }
+}
