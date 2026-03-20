@@ -151,6 +151,7 @@ export class BotController {
   private readonly approvalChatByRequest = new Map<string, ChatTarget>();
   private readonly openai = features.hasOpenAI ? new OpenAI({ apiKey: env.OPENAI_API_KEY! }) : null;
   private readonly forumEnsureByThread = new Map<string, Promise<ForumThreadTopic | null>>();
+  private readonly forumHistorySyncByThread = new Map<string, Promise<void>>();
 
   constructor(private readonly db: Database, private readonly hub: AgentHub) {
     this.bot = features.hasTelegram ? new Telegraf<Context>(env.TELEGRAM_BOT_TOKEN!) : null;
@@ -1074,33 +1075,53 @@ export class BotController {
       });
     }
 
-    return await this.syncForumThreadHistory(agentId, thread, topic, { sendIntro: created || topic.lastMirroredTurnId === null });
+    if (created || topic.lastMirroredTurnId === null) {
+      await this.sendHtmlToTarget(
+        { chatId: topic.chatId, messageThreadId: topic.topicId },
+        formatForumTopicIntro({
+          threadTitle: thread.title,
+          projectName: project?.name ?? null,
+          legacy: thread.legacy,
+        }),
+      );
+    }
+
+    this.queueForumHistorySync(agentId, thread, topic);
+    return topic;
+  }
+
+  private queueForumHistorySync(agentId: string, thread: CachedThread, topic: ForumThreadTopic): void {
+    const existing = this.forumHistorySyncByThread.get(thread.threadId);
+    if (existing) return;
+
+    const task = this.syncForumThreadHistory(agentId, thread, topic)
+      .then(() => undefined)
+      .catch((error) => {
+        console.error('[forum] background history sync failed', JSON.stringify({
+          threadId: thread.threadId,
+          topicId: topic.topicId,
+          error: serializeError(error),
+        }));
+      })
+      .finally(() => {
+        this.forumHistorySyncByThread.delete(thread.threadId);
+      });
+
+    this.forumHistorySyncByThread.set(thread.threadId, task);
   }
 
   private async syncForumThreadHistory(
     agentId: string,
     thread: CachedThread,
     topic: ForumThreadTopic,
-    options: { sendIntro: boolean },
   ): Promise<ForumThreadTopic> {
     const target = { chatId: topic.chatId, messageThreadId: topic.topicId };
-    const projects = await this.hub.listProjects(agentId);
-    const project = thread.projectId ? projects.find((entry) => entry.projectId === thread.projectId) ?? null : null;
-
-    if (options.sendIntro) {
-      await this.sendHtmlToTarget(target, formatForumTopicIntro({
-        threadTitle: thread.title,
-        projectName: project?.name ?? null,
-        legacy: thread.legacy,
-      }));
-    }
-
     const history = (await this.hub.sendRequest(agentId, {
       type: 'control.readThread',
       requestId: randomUUID(),
       threadId: thread.threadId,
       limitTurns: 0,
-    })) as { turns: TranscriptTurn[] };
+    }, 120_000)) as { turns: TranscriptTurn[] };
 
     let pendingTurns = history.turns;
     if (topic.lastMirroredTurnId) {
