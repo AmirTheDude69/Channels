@@ -104,8 +104,8 @@ const TELEGRAM_HTML_OPTIONS = {
   link_preview_options: { is_disabled: true },
 };
 
-const INITIAL_FORUM_HISTORY_TURN_LIMIT = 2;
-const INCREMENTAL_FORUM_HISTORY_TURN_LIMIT = 8;
+const INITIAL_FORUM_HISTORY_TURN_LIMIT = 1;
+const INCREMENTAL_FORUM_HISTORY_TURN_LIMIT = 4;
 const TELEGRAM_RETRY_LIMIT = 5;
 
 if (typeof globalThis.File === 'undefined') {
@@ -1051,7 +1051,10 @@ export class BotController {
 
     for (const thread of threads) {
       try {
-        const topic = await this.ensureForumMirrorForThread(agentId, thread.threadId, { queueHistory: false });
+        const topic = await this.ensureForumMirrorForThread(agentId, thread.threadId, {
+          queueHistory: false,
+          sendIntro: false,
+        });
         if (topic) {
           topicsToBackfill.push({ thread, topic });
         }
@@ -1092,7 +1095,7 @@ export class BotController {
   private async ensureForumMirrorForThread(
     agentId: string,
     threadId: string,
-    options?: { queueHistory?: boolean },
+    options?: { queueHistory?: boolean; sendIntro?: boolean },
   ): Promise<ForumThreadTopic | null> {
     const inFlight = this.forumEnsureByThread.get(threadId);
     if (inFlight) {
@@ -1111,7 +1114,7 @@ export class BotController {
   private async ensureForumMirrorForThreadInner(
     agentId: string,
     threadId: string,
-    options?: { queueHistory?: boolean },
+    options?: { queueHistory?: boolean; sendIntro?: boolean },
   ): Promise<ForumThreadTopic | null> {
     if (!this.bot) return null;
 
@@ -1128,6 +1131,7 @@ export class BotController {
     let topic = await this.db.getForumThreadTopic(threadId);
     let created = false;
     const shouldQueueHistory = options?.queueHistory ?? true;
+    const shouldSendIntro = options?.sendIntro ?? true;
 
     if (!topic || topic.chatId !== forumChatId) {
       const createdTopic = await this.callTelegramApiWithRetry<{ message_thread_id: number }>('createForumTopic', {
@@ -1165,7 +1169,7 @@ export class BotController {
       });
     }
 
-    if (created) {
+    if (created && shouldSendIntro) {
       await this.sendHtmlToTarget(
         { chatId: topic.chatId, messageThreadId: topic.topicId },
         formatForumTopicIntro({
