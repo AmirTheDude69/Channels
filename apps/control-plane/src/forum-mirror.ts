@@ -1,4 +1,4 @@
-import type { TranscriptEntry, TurnAttachment } from '@channels/shared';
+import type { TranscriptEntry, TranscriptTurn, TurnAttachment } from '@channels/shared';
 import { chunkTelegramHtml, markdownToTelegramBlocks, plainTextToTelegramHtml } from './telegram-format.js';
 
 const TOPIC_NAME_LIMIT = 120;
@@ -50,6 +50,23 @@ export function formatForumTranscriptEntry(entry: TranscriptEntry): string[] {
     '<b>Codex</b>',
     ...markdownToTelegramBlocks(entry.text),
   ]);
+}
+
+export function selectForumTurnsToImport(turns: TranscriptTurn[], lastMirroredTurnId: string | null): TranscriptTurn[] {
+  if (turns.length === 0) return [];
+  if (!lastMirroredTurnId) return turns;
+
+  const lastMirroredIndex = turns.findIndex((turn) => turn.turnId === lastMirroredTurnId);
+  if (lastMirroredIndex >= 0) {
+    return turns.slice(lastMirroredIndex + 1);
+  }
+
+  const latestTurn = turns.at(-1);
+  if (!latestTurn || latestTurn.turnId === lastMirroredTurnId) {
+    return [];
+  }
+
+  return [latestTurn];
 }
 
 export function formatForumPromptMirror(args: {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildForumTopicTitle, formatForumPromptMirror, formatForumTranscriptEntry } from '../src/forum-mirror.js';
+import { buildForumTopicTitle, formatForumPromptMirror, formatForumTranscriptEntry, selectForumTurnsToImport } from '../src/forum-mirror.js';
 
 describe('forum mirror helpers', () => {
   it('builds compact topic titles with project prefixes', () => {
@@ -31,5 +31,33 @@ describe('forum mirror helpers', () => {
 
     expect(chunks.join('\n\n')).toContain('<b>Codex</b>');
     expect(chunks.join('\n\n')).toContain('Updated the bot');
+  });
+
+  it('keeps the recent turns for a fresh forum import', () => {
+    const turns = [
+      { turnId: 'turn_1', entries: [] },
+      { turnId: 'turn_2', entries: [] },
+    ];
+
+    expect(selectForumTurnsToImport(turns, null)).toEqual(turns);
+  });
+
+  it('imports only turns after the last mirrored turn when it is still in the fetched window', () => {
+    const turns = [
+      { turnId: 'turn_1', entries: [] },
+      { turnId: 'turn_2', entries: [] },
+      { turnId: 'turn_3', entries: [] },
+    ];
+
+    expect(selectForumTurnsToImport(turns, 'turn_2')).toEqual([{ turnId: 'turn_3', entries: [] }]);
+  });
+
+  it('falls back to only the latest turn when the last mirrored turn is no longer in the fetched window', () => {
+    const turns = [
+      { turnId: 'turn_8', entries: [] },
+      { turnId: 'turn_9', entries: [] },
+    ];
+
+    expect(selectForumTurnsToImport(turns, 'turn_3')).toEqual([{ turnId: 'turn_9', entries: [] }]);
   });
 });

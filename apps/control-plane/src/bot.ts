@@ -45,6 +45,7 @@ import {
   formatForumPromptMirror,
   formatForumTopicIntro,
   formatForumTranscriptEntry,
+  selectForumTurnsToImport,
 } from './forum-mirror.js';
 
 type TelegramTextContext = NarrowedContext<Context, Types.MountMap['text']>;
@@ -103,6 +104,10 @@ const TELEGRAM_HTML_OPTIONS = {
   link_preview_options: { is_disabled: true },
 };
 
+const INITIAL_FORUM_HISTORY_TURN_LIMIT = 2;
+const INCREMENTAL_FORUM_HISTORY_TURN_LIMIT = 8;
+const TELEGRAM_RETRY_LIMIT = 5;
+
 if (typeof globalThis.File === 'undefined') {
   globalThis.File = NodeFile as unknown as typeof globalThis.File;
 }
@@ -136,6 +141,48 @@ function summarizeContextError(error: unknown, fallback: string): string {
   return fallback;
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+function telegramRetryAfterMs(error: unknown): number | null {
+  const candidate = error as {
+    status?: unknown;
+    code?: unknown;
+    description?: unknown;
+    response?: {
+      error_code?: unknown;
+      description?: unknown;
+      parameters?: { retry_after?: unknown } | null;
+    } | null;
+    parameters?: { retry_after?: unknown } | null;
+  };
+
+  const retryAfterSeconds = Number(
+    candidate.response?.parameters?.retry_after
+      ?? candidate.parameters?.retry_after
+      ?? NaN,
+  );
+
+  if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0) {
+    return retryAfterSeconds * 1000;
+  }
+
+  const status = Number(candidate.response?.error_code ?? candidate.status ?? candidate.code ?? NaN);
+  const description = String(candidate.response?.description ?? candidate.description ?? '');
+  if (status === 429 || /too many requests/i.test(description)) {
+    const retryMatch = description.match(/retry after (\d+)/i);
+    if (retryMatch) {
+      return Number(retryMatch[1]) * 1000;
+    }
+    return 1000;
+  }
+
+  return null;
+}
+
 export function applyThreadSelection(session: Pick<ChatSession, 'activeProjectId' | 'activeThreadId'>, thread: CachedThread | null, threadId: string): void {
   session.activeThreadId = threadId;
   session.activeProjectId = thread?.projectId ?? null;
@@ -152,6 +199,8 @@ export class BotController {
   private readonly openai = features.hasOpenAI ? new OpenAI({ apiKey: env.OPENAI_API_KEY! }) : null;
   private readonly forumEnsureByThread = new Map<string, Promise<ForumThreadTopic | null>>();
   private readonly forumHistorySyncByThread = new Map<string, Promise<void>>();
+  private forumHistoryQueue: Promise<void> = Promise.resolve();
+  private forumMirrorSyncInFlight: Promise<void> | null = null;
 
   constructor(private readonly db: Database, private readonly hub: AgentHub) {
     this.bot = features.hasTelegram ? new Telegraf<Context>(env.TELEGRAM_BOT_TOKEN!) : null;
@@ -311,9 +360,32 @@ export class BotController {
     }
 
     await this.sendHtmlToTarget(target, '<b>Forum mirror linked.</b>\n\nI’m creating one topic per Codex thread here and will keep future turns synced.\n\nTo allow normal quick messages inside topics, disable the bot privacy setting in BotFather with <code>/setprivacy</code>.');
-    void this.syncForumMirror(String(ctx.chat.id)).catch((error) => {
+    void this.syncLinkedForumMirror().catch((error) => {
       console.error('[forum] initial sync failed', JSON.stringify({ chatId: String(ctx.chat.id), error: serializeError(error) }));
     });
+  }
+
+  async syncLinkedForumMirror(): Promise<void> {
+    const forumChatId = await this.getForumMirrorChatId();
+    if (!forumChatId) return;
+
+    if (this.forumMirrorSyncInFlight) {
+      await this.forumMirrorSyncInFlight;
+      return;
+    }
+
+    const task = this.syncForumMirror(forumChatId)
+      .catch((error) => {
+        console.error('[forum] linked sync failed', JSON.stringify({ chatId: forumChatId, error: serializeError(error) }));
+      })
+      .finally(() => {
+        if (this.forumMirrorSyncInFlight === task) {
+          this.forumMirrorSyncInFlight = null;
+        }
+      });
+
+    this.forumMirrorSyncInFlight = task;
+    await task;
   }
 
   async renderHome(chatId: number | string, telegramUserId: number | string, reply: TelegramReply): Promise<void> {
@@ -975,9 +1047,14 @@ export class BotController {
     const agentId = this.hub.getConnectedAgentId();
     if (!agentId) return;
     const threads = await this.hub.listAllThreads(agentId);
+    const topicsToBackfill: Array<{ thread: CachedThread; topic: ForumThreadTopic }> = [];
+
     for (const thread of threads) {
       try {
-        await this.ensureForumMirrorForThread(agentId, thread.threadId);
+        const topic = await this.ensureForumMirrorForThread(agentId, thread.threadId, { queueHistory: false });
+        if (topic) {
+          topicsToBackfill.push({ thread, topic });
+        }
       } catch (error) {
         console.error('[forum] sync thread failed', JSON.stringify({
           chatId,
@@ -985,6 +1062,10 @@ export class BotController {
           error: serializeError(error),
         }));
       }
+    }
+
+    for (const { thread, topic } of topicsToBackfill) {
+      this.queueForumHistorySync(agentId, thread, topic);
     }
   }
 
@@ -1008,13 +1089,17 @@ export class BotController {
     return { agentId, thread, topic };
   }
 
-  private async ensureForumMirrorForThread(agentId: string, threadId: string): Promise<ForumThreadTopic | null> {
+  private async ensureForumMirrorForThread(
+    agentId: string,
+    threadId: string,
+    options?: { queueHistory?: boolean },
+  ): Promise<ForumThreadTopic | null> {
     const inFlight = this.forumEnsureByThread.get(threadId);
     if (inFlight) {
       return await inFlight;
     }
 
-    const promise = this.ensureForumMirrorForThreadInner(agentId, threadId)
+    const promise = this.ensureForumMirrorForThreadInner(agentId, threadId, options)
       .finally(() => {
         this.forumEnsureByThread.delete(threadId);
       });
@@ -1023,7 +1108,11 @@ export class BotController {
     return await promise;
   }
 
-  private async ensureForumMirrorForThreadInner(agentId: string, threadId: string): Promise<ForumThreadTopic | null> {
+  private async ensureForumMirrorForThreadInner(
+    agentId: string,
+    threadId: string,
+    options?: { queueHistory?: boolean },
+  ): Promise<ForumThreadTopic | null> {
     if (!this.bot) return null;
 
     const forumChatId = await this.getForumMirrorChatId();
@@ -1038,12 +1127,13 @@ export class BotController {
 
     let topic = await this.db.getForumThreadTopic(threadId);
     let created = false;
+    const shouldQueueHistory = options?.queueHistory ?? true;
 
     if (!topic || topic.chatId !== forumChatId) {
-      const createdTopic = await this.bot.telegram.callApi('createForumTopic', {
+      const createdTopic = await this.callTelegramApiWithRetry<{ message_thread_id: number }>('createForumTopic', {
         chat_id: Number(forumChatId),
         name: topicName,
-      }) as { message_thread_id: number };
+      });
 
       topic = await this.db.upsertForumThreadTopic({
         threadId,
@@ -1055,7 +1145,7 @@ export class BotController {
       created = true;
     } else if (topic.topicName !== topicName) {
       try {
-        await this.bot.telegram.callApi('editForumTopic', {
+        await this.callTelegramApiWithRetry('editForumTopic', {
           chat_id: Number(forumChatId),
           message_thread_id: topic.topicId,
           name: topicName,
@@ -1075,7 +1165,7 @@ export class BotController {
       });
     }
 
-    if (created || topic.lastMirroredTurnId === null) {
+    if (created) {
       await this.sendHtmlToTarget(
         { chatId: topic.chatId, messageThreadId: topic.topicId },
         formatForumTopicIntro({
@@ -1086,7 +1176,10 @@ export class BotController {
       );
     }
 
-    this.queueForumHistorySync(agentId, thread, topic);
+    if (shouldQueueHistory) {
+      this.queueForumHistorySync(agentId, thread, topic);
+    }
+
     return topic;
   }
 
@@ -1094,8 +1187,11 @@ export class BotController {
     const existing = this.forumHistorySyncByThread.get(thread.threadId);
     if (existing) return;
 
-    const task = this.syncForumThreadHistory(agentId, thread, topic)
-      .then(() => undefined)
+    const task = this.forumHistoryQueue
+      .catch(() => undefined)
+      .then(async () => {
+        await this.syncForumThreadHistory(agentId, thread, topic);
+      })
       .catch((error) => {
         console.error('[forum] background history sync failed', JSON.stringify({
           threadId: thread.threadId,
@@ -1107,6 +1203,7 @@ export class BotController {
         this.forumHistorySyncByThread.delete(thread.threadId);
       });
 
+    this.forumHistoryQueue = task.catch(() => undefined);
     this.forumHistorySyncByThread.set(thread.threadId, task);
   }
 
@@ -1116,20 +1213,15 @@ export class BotController {
     topic: ForumThreadTopic,
   ): Promise<ForumThreadTopic> {
     const target = { chatId: topic.chatId, messageThreadId: topic.topicId };
+    const limitTurns = topic.lastMirroredTurnId ? INCREMENTAL_FORUM_HISTORY_TURN_LIMIT : INITIAL_FORUM_HISTORY_TURN_LIMIT;
     const history = (await this.hub.sendRequest(agentId, {
       type: 'control.readThread',
       requestId: randomUUID(),
       threadId: thread.threadId,
-      limitTurns: 0,
+      limitTurns,
     }, 120_000)) as { turns: TranscriptTurn[] };
 
-    let pendingTurns = history.turns;
-    if (topic.lastMirroredTurnId) {
-      const lastMirroredIndex = history.turns.findIndex((turn) => turn.turnId === topic.lastMirroredTurnId);
-      if (lastMirroredIndex >= 0) {
-        pendingTurns = history.turns.slice(lastMirroredIndex + 1);
-      }
-    }
+    const pendingTurns = selectForumTurnsToImport(history.turns, topic.lastMirroredTurnId);
 
     let latestTopic = topic;
     for (const turn of pendingTurns) {
@@ -1591,7 +1683,9 @@ export class BotController {
 
   private async sendHtml(chatId: string, message: string, extra?: Record<string, unknown>): Promise<unknown> {
     if (!this.bot) return null;
-    return await this.bot.telegram.sendMessage(Number(chatId), message, this.messageOptions(extra));
+    return await this.withTelegramRetry(`sendMessage:${chatId}`, async () => {
+      return await this.bot!.telegram.sendMessage(Number(chatId), message, this.messageOptions(extra));
+    });
   }
 
   private async sendPlainToTarget(target: ChatTarget, message: string, extra?: Record<string, unknown>): Promise<{ message_id: number } | null> {
@@ -1603,15 +1697,19 @@ export class BotController {
 
   private async sendPlain(chatId: string, message: string, extra?: Record<string, unknown>): Promise<{ message_id: number } | null> {
     if (!this.bot) return null;
-    return await this.bot.telegram.sendMessage(Number(chatId), message, {
-      link_preview_options: { is_disabled: true },
-      ...extra,
-    }) as { message_id: number };
+    return await this.withTelegramRetry(`sendPlain:${chatId}`, async () => {
+      return await this.bot!.telegram.sendMessage(Number(chatId), message, {
+        link_preview_options: { is_disabled: true },
+        ...extra,
+      }) as { message_id: number };
+    });
   }
 
   private async editHtml(chatId: string, messageId: number, message: string, extra?: Record<string, unknown>): Promise<unknown> {
     if (!this.bot) return null;
-    return await this.bot.telegram.editMessageText(Number(chatId), messageId, undefined, message, this.messageOptions(extra));
+    return await this.withTelegramRetry(`editMessageText:${chatId}:${messageId}`, async () => {
+      return await this.bot!.telegram.editMessageText(Number(chatId), messageId, undefined, message, this.messageOptions(extra));
+    });
   }
 
   private messageOptions(extra?: Record<string, unknown>): Record<string, unknown> {
@@ -1619,5 +1717,39 @@ export class BotController {
       ...TELEGRAM_HTML_OPTIONS,
       ...extra,
     };
+  }
+
+  private async callTelegramApiWithRetry<T = unknown>(
+    method: Parameters<Telegraf<Context>['telegram']['callApi']>[0],
+    payload: Record<string, unknown>,
+  ): Promise<T> {
+    if (!this.bot) {
+      throw new Error(`Telegram bot is unavailable for ${method}`);
+    }
+
+    return await this.withTelegramRetry(`callApi:${method}`, async () => {
+      return await this.bot!.telegram.callApi(method, payload) as T;
+    });
+  }
+
+  private async withTelegramRetry<T>(label: string, operation: () => Promise<T>): Promise<T> {
+    let attempt = 0;
+
+    while (true) {
+      try {
+        return await operation();
+      } catch (error) {
+        attempt += 1;
+        const retryAfterMs = telegramRetryAfterMs(error);
+
+        if (!retryAfterMs || attempt >= TELEGRAM_RETRY_LIMIT) {
+          throw error;
+        }
+
+        const delayMs = Math.min(retryAfterMs + 250, 60_000);
+        console.warn('[telegram] rate limited, retrying', JSON.stringify({ label, attempt, delayMs }));
+        await sleep(delayMs);
+      }
+    }
   }
 }
