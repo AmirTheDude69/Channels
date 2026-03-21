@@ -41,7 +41,7 @@ async function main(): Promise<void> {
     onMessage: async (agentId, message) => {
       await botController.onAgentMessage(agentId, message);
       if (message.type === 'agent.sync.threads') {
-        void botController.syncLinkedForumMirror().catch((error) => {
+        void botController.syncLinkedForumMirrorIfNeeded(agentId).catch((error) => {
           app.log.error({ error: serializeError(error), agentId }, 'Linked forum sync failed after thread sync');
         });
       }

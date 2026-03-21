@@ -389,6 +389,23 @@ export class BotController {
     await task;
   }
 
+  async syncLinkedForumMirrorIfNeeded(agentId?: string | null): Promise<void> {
+    const resolvedAgentId = agentId ?? this.hub.getConnectedAgentId();
+    if (!resolvedAgentId) return;
+
+    const forumChatId = await this.getForumMirrorChatId();
+    if (!forumChatId) return;
+
+    const threads = await this.hub.listAllThreads(resolvedAgentId);
+    for (const thread of threads) {
+      const topic = await this.db.getForumThreadTopic(thread.threadId);
+      if (!topic || topic.chatId !== forumChatId || topic.lastMirroredTurnId === null) {
+        await this.syncLinkedForumMirror();
+        return;
+      }
+    }
+  }
+
   async renderHome(chatId: number | string, telegramUserId: number | string, reply: TelegramReply): Promise<void> {
     const session = await this.ensureSession(chatId, telegramUserId);
     const agentId = this.hub.getConnectedAgentId();
@@ -955,9 +972,13 @@ export class BotController {
         await this.sendHtmlToTarget({ chatId: run.chatId, messageThreadId: run.messageThreadId }, chunk);
       }
       if (run.mirrorTarget) {
-        const mirrorChunks = formatForumTranscriptEntry({ role: 'assistant', text: finalText });
-        for (const chunk of mirrorChunks) {
-          await this.sendHtmlToTarget(run.mirrorTarget, chunk);
+        const forumTopic = await this.db.getForumThreadTopic(run.threadId);
+        const turnId = String(message.turnId);
+        if (forumTopic?.lastMirroredTurnId !== turnId) {
+          const mirrorChunks = formatForumTranscriptEntry({ role: 'assistant', text: finalText });
+          for (const chunk of mirrorChunks) {
+            await this.sendHtmlToTarget(run.mirrorTarget, chunk);
+          }
         }
       }
       await this.markForumTurnMirrored(run.threadId, String(message.turnId));
@@ -1217,8 +1238,10 @@ export class BotController {
     thread: CachedThread,
     topic: ForumThreadTopic,
   ): Promise<ForumThreadTopic> {
-    const target = { chatId: topic.chatId, messageThreadId: topic.topicId };
-    const limitTurns = topic.lastMirroredTurnId ? INCREMENTAL_FORUM_HISTORY_TURN_LIMIT : INITIAL_FORUM_HISTORY_TURN_LIMIT;
+    const currentTopic = await this.db.getForumThreadTopic(thread.threadId);
+    const effectiveTopic = currentTopic?.chatId === topic.chatId ? currentTopic : topic;
+    const target = { chatId: effectiveTopic.chatId, messageThreadId: effectiveTopic.topicId };
+    const limitTurns = effectiveTopic.lastMirroredTurnId ? INCREMENTAL_FORUM_HISTORY_TURN_LIMIT : INITIAL_FORUM_HISTORY_TURN_LIMIT;
     let history: { turns: TranscriptTurn[] };
     try {
       history = (await this.hub.sendRequest(agentId, {
@@ -1228,14 +1251,14 @@ export class BotController {
         limitTurns,
       }, 120_000)) as { turns: TranscriptTurn[] };
     } catch (error) {
-      if (topic.lastMirroredTurnId === null) {
+      if (effectiveTopic.lastMirroredTurnId === null) {
         const previewChunks = formatForumPreviewImport(thread.preview);
         if (previewChunks.length > 0) {
           for (const chunk of previewChunks) {
             await this.sendHtmlToTarget(target, chunk);
           }
           return await this.db.upsertForumThreadTopic({
-            ...topic,
+            ...effectiveTopic,
             lastMirroredTurnId: `preview:${thread.updatedAt}`,
           });
         }
@@ -1243,9 +1266,9 @@ export class BotController {
       throw error;
     }
 
-    const pendingTurns = selectForumTurnsToImport(history.turns, topic.lastMirroredTurnId);
+    const pendingTurns = selectForumTurnsToImport(history.turns, effectiveTopic.lastMirroredTurnId);
 
-    let latestTopic = topic;
+    let latestTopic = effectiveTopic;
     for (const turn of pendingTurns) {
       await this.mirrorTranscriptTurn(target, turn);
       latestTopic = await this.db.upsertForumThreadTopic({
