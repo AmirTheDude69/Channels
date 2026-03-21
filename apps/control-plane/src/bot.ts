@@ -43,6 +43,7 @@ import { plainTextToTelegramHtml } from './telegram-format.js';
 import {
   buildForumTopicTitle,
   formatForumPromptMirror,
+  formatForumPreviewImport,
   formatForumTopicIntro,
   formatForumTranscriptEntry,
   selectForumTurnsToImport,
@@ -1218,12 +1219,29 @@ export class BotController {
   ): Promise<ForumThreadTopic> {
     const target = { chatId: topic.chatId, messageThreadId: topic.topicId };
     const limitTurns = topic.lastMirroredTurnId ? INCREMENTAL_FORUM_HISTORY_TURN_LIMIT : INITIAL_FORUM_HISTORY_TURN_LIMIT;
-    const history = (await this.hub.sendRequest(agentId, {
-      type: 'control.readThread',
-      requestId: randomUUID(),
-      threadId: thread.threadId,
-      limitTurns,
-    }, 120_000)) as { turns: TranscriptTurn[] };
+    let history: { turns: TranscriptTurn[] };
+    try {
+      history = (await this.hub.sendRequest(agentId, {
+        type: 'control.readThread',
+        requestId: randomUUID(),
+        threadId: thread.threadId,
+        limitTurns,
+      }, 120_000)) as { turns: TranscriptTurn[] };
+    } catch (error) {
+      if (topic.lastMirroredTurnId === null) {
+        const previewChunks = formatForumPreviewImport(thread.preview);
+        if (previewChunks.length > 0) {
+          for (const chunk of previewChunks) {
+            await this.sendHtmlToTarget(target, chunk);
+          }
+          return await this.db.upsertForumThreadTopic({
+            ...topic,
+            lastMirroredTurnId: `preview:${thread.updatedAt}`,
+          });
+        }
+      }
+      throw error;
+    }
 
     const pendingTurns = selectForumTurnsToImport(history.turns, topic.lastMirroredTurnId);
 

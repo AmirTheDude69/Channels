@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildForumTopicTitle, formatForumPromptMirror, formatForumTranscriptEntry, selectForumTurnsToImport } from '../src/forum-mirror.js';
+import { buildForumTopicTitle, formatForumPreviewImport, formatForumPromptMirror, formatForumTranscriptEntry, selectForumTurnsToImport } from '../src/forum-mirror.js';
 
 describe('forum mirror helpers', () => {
   it('builds compact topic titles with project prefixes', () => {
@@ -31,6 +31,13 @@ describe('forum mirror helpers', () => {
 
     expect(chunks.join('\n\n')).toContain('<b>Codex</b>');
     expect(chunks.join('\n\n')).toContain('Updated the bot');
+  });
+
+  it('formats a recent preview fallback when transcript import times out', () => {
+    const chunks = formatForumPreviewImport('Latest assistant preview');
+
+    expect(chunks.join('\n\n')).toContain('Recent preview');
+    expect(chunks.join('\n\n')).toContain('Latest assistant preview');
   });
 
   it('keeps the recent turns for a fresh forum import', () => {

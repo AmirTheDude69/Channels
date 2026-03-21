@@ -52,6 +52,16 @@ export function formatForumTranscriptEntry(entry: TranscriptEntry): string[] {
   ]);
 }
 
+export function formatForumPreviewImport(preview: string): string[] {
+  const normalized = collapseWhitespace(preview);
+  if (!normalized) return [];
+
+  return chunkTelegramHtml([
+    '<b>Recent preview</b>',
+    `<blockquote>${plainTextToTelegramHtml(normalized)}</blockquote>`,
+  ]);
+}
+
 export function selectForumTurnsToImport(turns: TranscriptTurn[], lastMirroredTurnId: string | null): TranscriptTurn[] {
   if (turns.length === 0) return [];
   if (!lastMirroredTurnId) return turns;
